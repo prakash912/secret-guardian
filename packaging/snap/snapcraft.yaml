@@ -1,0 +1,48 @@
+name: secret-guardian
+base: core22
+version: '1.0.0'
+summary: Monitor clipboard for sensitive data and secrets
+description: |
+  Secret Guardian is a desktop application that monitors your clipboard
+  and alerts you when you copy sensitive data like API keys, tokens, or secrets.
+  Helps prevent accidentally sharing sensitive information.
+
+grade: stable
+confinement: strict
+
+apps:
+  secret-guardian:
+    command: secret-guardian
+    plugs:
+      - desktop
+      - desktop-legacy
+      - wayland
+      - x11
+      - unity7
+      - opengl
+      - network
+      - pulseaudio
+      - home
+      - removable-media
+
+parts:
+  secret-guardian:
+    plugin: dump
+    source: https://github.com/YOUR_USERNAME/secret-guardian/releases/download/v1.0.0/
+    source-type: tar
+    # You'll need to provide a tar.gz of the Linux build
+    # Or use a different plugin to build from source
+    stage-packages:
+      - libnss3
+      - libatk-bridge2.0-0
+      - libdrm2
+      - libxkbcommon0
+      - libxcomposite1
+      - libxdamage1
+      - libxfixes3
+      - libxrandr2
+      - libgbm1
+      - libasound2
+      - libatspi2.0-0
+      - libgtk-3-0
+
