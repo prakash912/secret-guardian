@@ -79,3 +79,4 @@ echo ""
 echo "✅ Release created successfully!"
 echo "View it at: https://github.com/prakash912/secret-guardian/releases/tag/$VERSION"
 
+

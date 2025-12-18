@@ -57,3 +57,4 @@ fi
 echo ""
 echo "Done! Copy these checksums to your package manager configuration files."
 
+

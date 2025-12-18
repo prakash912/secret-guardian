@@ -24,3 +24,4 @@ if ($exeFiles) {
 Write-Host ""
 Write-Host "Done! Copy these checksums to your Chocolatey configuration files." -ForegroundColor Cyan
 
+

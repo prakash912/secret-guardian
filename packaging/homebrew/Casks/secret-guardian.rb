@@ -1,6 +1,6 @@
 cask "secret-guardian" do
   version "1.0.0"
-  sha256 "5b3fb121d01314696142e2d27771e158da11135dfc752b19a8e512abcba61f85"
+  sha256 "2f926caa4180e031814138633e9fa767209f42477461a3ea622d3db4569f3c2e"
 
   url "https://github.com/prakash912/secret-guardian/releases/download/v#{version}/secret-guardian-#{version}-arm64.dmg",
       verified: "github.com/prakash912/secret-guardian/"

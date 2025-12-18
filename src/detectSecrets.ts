@@ -87,6 +87,11 @@ function calculateEntropy(str: string): number {
 }
 
 export function detectSecrets(text: string): DetectionResult {
+  // 0️⃣ Skip encrypted shared secrets - they're safe to paste
+  if (text.startsWith("SG_ENCRYPTED:")) {
+    return { detected: false };
+  }
+  
   // 1️⃣ Known high-confidence patterns
   for (const p of patterns) {
     if (p.regex.test(text)) {
