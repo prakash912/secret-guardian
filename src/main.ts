@@ -4,8 +4,8 @@ import fs from "fs";
 import { detectSecrets } from "./detectSecrets";
 import { getConfig, updateConfig, AVAILABLE_APPS, AVAILABLE_PATTERNS } from "./config";
 import { addToHistory, getHistory, clearHistory, getPreviousSafeItem } from "./clipboardHistory";
-import { showPasteBlockDialog, allowPasteTemporarily, clearCurrentSecret, registerRedactedPasteHotkey, unregisterPasteInterception, cleanupBlockingDialog, registerPasteBlocking, showDecryptDialog, closeDecryptDialog, closeBlockingDialog, isPasteAllowed } from "./pasteBlocker";
-import { redactSecret, encryptForSharing, decryptShared, isEncryptedShared } from "./utils";
+import { showPasteBlockDialog, allowPasteTemporarily, clearCurrentSecret, registerRedactedPasteHotkey, unregisterPasteInterception, cleanupBlockingDialog, registerPasteBlocking, showDecryptDialog, closeDecryptDialog, closeBlockingDialog, getIsBlockingPaste, getLastBlockedPasteTime, setCurrentSecret } from "./pasteBlocker";
+import { redactSecret, encryptForSharing, decryptShared, isEncryptedShared, getActiveAppName } from "./utils";
 
 app.setAppUserModelId("com.secretguardian.app");
 app.setName("Secret Guardian");
@@ -15,9 +15,6 @@ let lastText = "";
 let currentSecret: string | null = null;
 let autoClearTimer: NodeJS.Timeout | null = null;
 let clipboardMonitorStarted = false;
-let lastWarningTime = 0;
-const WARNING_COOLDOWN = 3000; // 3 seconds between warnings for same secret
-let lastClipboardChangeTime = 0;
 // COPY_DETECTION_DELAY removed - using clipboardChanged check instead
 
 // Monitor clipboard for paste blocking
@@ -276,10 +273,27 @@ function startPasteMonitoring() {
   
   // Initialize with current clipboard to avoid false positives on startup
   let lastClipboardText = "";
+  let lastAppName = "";
+  let clipboardHasSecret = false;
+  
+  // Initialize last app name
+  getActiveAppName()
+    .then((appName) => {
+      lastAppName = appName;
+    })
+    .catch(() => {
+      lastAppName = "Unknown";
+    });
+  
   try {
     const initialClipboard = clipboard.readText().trim();
     if (initialClipboard) {
       lastClipboardText = initialClipboard;
+      // Check if initial clipboard has a secret
+      if (initialClipboard.length >= 8 && !initialClipboard.startsWith("SG_ENCRYPTED:")) {
+        const detection = detectSecrets(initialClipboard);
+        clipboardHasSecret = detection.detected;
+      }
     }
   } catch (error) {
     // Clipboard might be empty - that's fine
@@ -290,8 +304,12 @@ function startPasteMonitoring() {
   // Delay paste monitoring to avoid false positives
   setTimeout(() => {
     pasteMonitorStarted = true;
-    console.log("✅ Clipboard monitoring active (history only)");
+    console.log("✅ Clipboard monitoring active (mouse paste blocking enabled)");
   }, 2000);
+  
+  // Track when secret was copied to clipboard
+  let secretCopiedTime = 0;
+  let secretContent = "";
   
   pasteMonitorInterval = setInterval(async () => {
     // Don't monitor until startup delay has passed
@@ -314,9 +332,6 @@ function startPasteMonitoring() {
         return;
       }
 
-      // STATIC BLOCKING: No app checks needed - always block secrets
-      // Removed app name detection and app allowed checks
-      
       // Only trigger if clipboard actually changed (not just checking the same content)
       const clipboardChanged = text !== lastClipboardText && text.length > 0;
       
@@ -325,7 +340,9 @@ function startPasteMonitoring() {
       if (clipboardChanged) {
         // Update tracking immediately
         lastClipboardText = text;
-        lastClipboardChangeTime = Date.now();
+        clipboardHasSecret = false;
+        secretCopiedTime = 0;
+        secretContent = "";
         
         // This is a COPY operation - just track in history silently, NO dialog, NO blocking
         if (text && text.length >= 8) {
@@ -333,6 +350,9 @@ function startPasteMonitoring() {
           if (!isEncryptedShared(text)) {
             const detection = detectSecrets(text);
             if (detection.detected) {
+              clipboardHasSecret = true;
+              secretCopiedTime = Date.now();
+              secretContent = text;
               // Track in history silently - NO dialog, NO blocking
               addToHistory(text, true, detection.type, "Unknown");
               updateTrayMenu();
@@ -344,35 +364,98 @@ function startPasteMonitoring() {
             addToHistory(text, true, "Encrypted Secret", "Unknown");
           }
         }
+        
+        // Update last app name when clipboard changes (copy happened in this app)
+        getActiveAppName()
+          .then((appName) => {
+            lastAppName = appName;
+          })
+          .catch(() => {
+            lastAppName = "Unknown";
+          });
+        
         return; // Exit immediately - NEVER show dialog on COPY
       }
       
-      // If clipboard didn't change, continue with paste detection
+      // MOUSE PASTE DETECTION: Immediate blocking for secrets
+      // Strategy: After a very short delay (50ms) from copy, if clipboard still has secret,
+      // aggressively monitor and block any paste attempt by clearing clipboard immediately
       if (!text || text.length < 8) {
         return;
       }
-      
+
       // CRITICAL: Check encrypted keys FIRST - they should NEVER be blocked
       if (isEncryptedShared(text)) {
         addToHistory(text, true, "Encrypted Secret", "Unknown");
         return; // Exit early - never block encrypted keys
       }
 
-      // CRITICAL: NO DIALOGS FROM CLIPBOARD MONITORING
-      // Clipboard monitoring is ONLY for tracking history on COPY
-      // ALL dialog showing is handled by globalShortcut handlers (Cmd+V/Ctrl+V) for keyboard paste
-      // Mouse paste detection is disabled - too unreliable and causes false positives on copy
-      // 
-      // If you need mouse paste blocking, use keyboard paste (Cmd+V) instead
-      // This ensures dialogs NEVER appear on copy operations
+      // Check if clipboard still has the same secret content
+      if (text !== lastClipboardText || text !== secretContent) {
+        return; // Content changed, not a paste
+      }
+
+      // Check if we have a secret in clipboard
+      if (!clipboardHasSecret || !secretContent || secretCopiedTime === 0) {
+        // Re-check if it's a secret (in case clipboard was set before monitoring started)
+        const detection = detectSecrets(text);
+        if (!detection.detected) {
+          return; // Not a secret
+        }
+        clipboardHasSecret = true;
+        secretContent = text;
+        secretCopiedTime = Date.now();
+      }
+
+      // IMMEDIATE MOUSE PASTE BLOCKING:
+      // After 50ms from copy, if clipboard still has secret, clear it immediately
+      // This prevents paste from working - when user tries to paste, clipboard will be empty
+      const timeSinceCopy = Date.now() - secretCopiedTime;
+      const PASTE_PROTECTION_DELAY = 50; // Very short delay - 50ms after copy
+
+      if (timeSinceCopy > PASTE_PROTECTION_DELAY && text === secretContent) {
+        // Prevent duplicate blocking
+        const now = Date.now();
+        const isBlocking = getIsBlockingPaste();
+        const lastBlocked = getLastBlockedPasteTime();
+        if (isBlocking && now - lastBlocked < 1000) {
+          return; // Already blocking
+        }
+
+        console.log(`🖱️ Mouse paste blocked immediately: ${detectSecrets(text).type}`);
+        
+        // Clear clipboard IMMEDIATELY to prevent paste
+        clipboard.clear();
+        setCurrentSecret(text);
+        
+        // Show blocking dialog IMMEDIATELY
+        const detection = detectSecrets(text);
+        showPasteBlockDialog(
+          text,
+          detection.type,
+          "Unknown",
+          () => {
+            allowPasteTemporarily(60);
+            setTimeout(() => clipboard.writeText(text), 100);
+          },
+          () => {
+            clipboard.writeText(encryptForSharing(text));
+          }
+        );
+        
+        // Reset to prevent re-detection
+        lastClipboardText = "";
+        clipboardHasSecret = false;
+        secretContent = "";
+        secretCopiedTime = 0;
+      }
       
-      // Just return - no processing, no dialogs
       return;
       
     } catch (error) {
       console.error("Error in clipboard monitoring:", error);
     }
-  }, 50); // Check every 50ms - very frequent to catch right-click paste immediately
+  }, 20); // Check every 20ms - very frequent to catch mouse paste immediately
 }
 
 app.whenReady().then(() => {

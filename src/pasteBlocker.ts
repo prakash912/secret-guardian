@@ -60,6 +60,19 @@ let isBlockingPaste = false; // Flag to prevent duplicate blocking from multiple
 let lastBlockedPasteTime = 0;
 const BLOCK_COOLDOWN = 1000; // 1 second cooldown between blocking attempts
 
+// Export getters/setters for mouse paste detection
+export function getIsBlockingPaste(): boolean {
+  return isBlockingPaste;
+}
+
+export function getLastBlockedPasteTime(): number {
+  return lastBlockedPasteTime;
+}
+
+export function setCurrentSecret(secret: string): void {
+  currentSecret = secret;
+}
+
 /**
  * Check if we should block a paste operation
  */
@@ -179,27 +192,38 @@ export function showPasteBlockDialog(
   onEncrypt?: () => void,
   onDecrypt?: (encryptedText: string) => void
 ): void {
+  console.log(`📱 showPasteBlockDialog called: ${secretType}, secret length: ${secret.length}`);
+  
   // Prevent duplicate dialogs (but allow if different secret)
   const now = Date.now();
-  if (now - lastDialogTime < DIALOG_COOLDOWN && currentSecret === secret) {
-    console.log("Dialog cooldown active - skipping duplicate");
+  if (now - lastDialogTime < DIALOG_COOLDOWN && currentSecret === secret && blockedWindow) {
+    console.log("   Dialog cooldown active - skipping duplicate");
     return;
   }
   
-  // Prevent showing dialog if we're already blocking a paste
-  if (isBlockingPaste && now - lastBlockedPasteTime < BLOCK_COOLDOWN) {
-    console.log("Already blocking a paste - skipping duplicate dialog");
-    return;
+  // If a dialog window already exists, close it first
+  if (blockedWindow) {
+    try {
+      blockedWindow.close();
+    } catch (error) {
+      // Ignore errors when closing old window
+    }
+    blockedWindow = null;
   }
   
   lastDialogTime = now;
   lastBlockedPasteTime = now;
   isBlockingPaste = true;
+  
+  console.log("   Creating dialog window...");
 
   // Ensure appName is valid (fallback to "Unknown" if empty)
   if (!appName || appName.trim().length === 0) {
     appName = "Unknown";
   }
+
+  // Prepare redacted secret for display (before creating window)
+  const redacted = redactSecret(secret);
 
   // Create a blocking window
   if (blockedWindow) {
@@ -213,37 +237,46 @@ export function showPasteBlockDialog(
 
   console.log(`📱 Creating paste block dialog for ${secretType} in ${appName}`);
 
-  blockedWindow = new BrowserWindow({
-    width: 600,
-    height: 500,
-    frame: false,
-    alwaysOnTop: true,
-    resizable: false,
-    skipTaskbar: true,
-    show: true, // Show IMMEDIATELY - don't wait for ready-to-show
-    webPreferences: {
-      nodeIntegration: true,
-      contextIsolation: false,
-      backgroundThrottling: false, // Don't throttle background
-    },
-  });
-
-  const redacted = redactSecret(secret);
-  
-  // Focus and bring to front immediately
-  if (blockedWindow) {
-    blockedWindow.focus();
-    blockedWindow.moveTop();
-  }
-  
-  // Also handle ready-to-show as backup
-  blockedWindow.once("ready-to-show", () => {
+  try {
+    blockedWindow = new BrowserWindow({
+      width: 600,
+      height: 500,
+      frame: false,
+      alwaysOnTop: true,
+      resizable: false,
+      skipTaskbar: true,
+      show: true, // Show IMMEDIATELY - don't wait for ready-to-show
+      webPreferences: {
+        nodeIntegration: true,
+        contextIsolation: false,
+        backgroundThrottling: false, // Don't throttle background
+      },
+    });
+    
+    console.log("   Window created, focusing...");
+    
+    // Focus and bring to front immediately
     if (blockedWindow) {
-      blockedWindow.show();
       blockedWindow.focus();
       blockedWindow.moveTop();
+      blockedWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
     }
-  });
+    
+    // Also handle ready-to-show as backup
+    blockedWindow.once("ready-to-show", () => {
+      console.log("   Window ready-to-show event fired");
+      if (blockedWindow) {
+        blockedWindow.show();
+        blockedWindow.focus();
+        blockedWindow.moveTop();
+      }
+    });
+    
+    console.log("   Window setup complete");
+  } catch (error) {
+    console.error("❌ Error creating dialog window:", error);
+    return;
+  }
   
   const html = `
     <!DOCTYPE html>
@@ -336,11 +369,29 @@ export function showPasteBlockDialog(
     </html>
   `;
 
-  blockedWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
+  // Load HTML content
+  try {
+    const htmlUrl = `data:text/html;charset=utf-8,${encodeURIComponent(html)}`;
+    console.log("   Loading HTML content...");
+    blockedWindow.loadURL(htmlUrl);
+    console.log("   HTML content loaded");
+  } catch (error) {
+    console.error("❌ Error loading HTML:", error);
+  }
 
   // Handle window errors
   blockedWindow.webContents.on("did-fail-load", (event, errorCode, errorDescription) => {
     console.error(`❌ Dialog failed to load: ${errorCode} - ${errorDescription}`);
+  });
+
+  // Handle successful load
+  blockedWindow.webContents.on("did-finish-load", () => {
+    console.log("✅ Dialog HTML loaded successfully");
+    if (blockedWindow) {
+      blockedWindow.show();
+      blockedWindow.focus();
+      blockedWindow.moveTop();
+    }
   });
 
   // Handle window close
@@ -349,6 +400,8 @@ export function showPasteBlockDialog(
     isBlockingPaste = false; // Reset blocking flag when dialog closes
     console.log("Dialog closed");
   });
+  
+  console.log("✅ Dialog setup complete - should be visible");
 
   // Store callbacks for IPC
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -705,9 +758,12 @@ export function registerPasteBlocking(): void {
   // Register Cmd+V for macOS - SIMPLE & FAST
   if (process.platform === "darwin") {
     const cmdSuccess = globalShortcut.register("Command+V", () => {
+      console.log("🔍 Cmd+V detected!");
+      
       // Allow paste in dialogs
       const focusedWindow = BrowserWindow.getFocusedWindow();
       if (focusedWindow && (focusedWindow === decryptWindow || blockedWindow)) {
+        console.log("   Allowing paste in dialog");
         focusedWindow.webContents.paste();
         return;
       }
@@ -715,25 +771,29 @@ export function registerPasteBlocking(): void {
       // Prevent duplicate blocking
       const now = Date.now();
       if (isBlockingPaste && now - lastBlockedPasteTime < BLOCK_COOLDOWN) {
+        console.log("   Already blocking - skipping");
         return;
       }
       
       // SIMPLE CHECK: Is it a secret? Block it immediately
+      console.log("   Checking clipboard for secrets...");
       const result = shouldBlockPasteSync();
+      console.log("   Check result:", result.shouldBlock ? "BLOCK" : "ALLOW", result.detection?.type || "none");
+      
       if (result.shouldBlock && result.clipboardText && result.detection) {
-        isBlockingPaste = true;
-        lastBlockedPasteTime = now;
+        console.log(`🚫 Blocking paste: ${result.detection.type}`);
         
-        // Clear clipboard and show dialog IMMEDIATELY
+        // Clear clipboard IMMEDIATELY
         clipboard.clear();
         currentSecret = result.clipboardText;
         
-        // Show dialog IMMEDIATELY - no waiting
+        // Show dialog IMMEDIATELY - don't set isBlockingPaste here, let the dialog function set it
         const clipboardText = result.clipboardText;
+        console.log("   Showing blocking dialog...");
         showPasteBlockDialog(
           clipboardText,
           result.detection.type,
-          "Unknown", // App name not needed for static blocking
+          "Unknown",
           () => {
             allowPasteTemporarily(60);
             isBlockingPaste = false;
@@ -744,6 +804,9 @@ export function registerPasteBlocking(): void {
             isBlockingPaste = false;
           }
         );
+        console.log("   Dialog should be visible now");
+      } else {
+        console.log("   Not blocking - allowing paste");
       }
     });
     if (cmdSuccess) {
@@ -756,9 +819,12 @@ export function registerPasteBlocking(): void {
   
   // Register Ctrl+V for all platforms - SIMPLE & FAST
   const ctrlSuccess = globalShortcut.register("Control+V", () => {
+    console.log("🔍 Ctrl+V detected!");
+    
     // Allow paste in dialogs
     const focusedWindow = BrowserWindow.getFocusedWindow();
     if (focusedWindow && (focusedWindow === decryptWindow || blockedWindow)) {
+      console.log("   Allowing paste in dialog");
       focusedWindow.webContents.paste();
       return;
     }
@@ -766,38 +832,45 @@ export function registerPasteBlocking(): void {
     // Prevent duplicate blocking
     const now = Date.now();
     if (isBlockingPaste && now - lastBlockedPasteTime < BLOCK_COOLDOWN) {
+      console.log("   Already blocking - skipping");
       return;
     }
     
     // SIMPLE CHECK: Is it a secret? Block it immediately
+    console.log("   Checking clipboard for secrets...");
     const result = shouldBlockPasteSync();
+    console.log("   Check result:", result.shouldBlock ? "BLOCK" : "ALLOW", result.detection?.type || "none");
+    
     if (result.shouldBlock && result.clipboardText && result.detection) {
-      isBlockingPaste = true;
-      lastBlockedPasteTime = now;
+      console.log(`🚫 Blocking paste: ${result.detection.type}`);
       
-      // Clear clipboard and show dialog IMMEDIATELY
+      // Clear clipboard IMMEDIATELY
       clipboard.clear();
       currentSecret = result.clipboardText;
       
-      // Show dialog IMMEDIATELY - no waiting
+      // Show dialog IMMEDIATELY - don't set isBlockingPaste here, let the dialog function set it
+      console.log("   Showing blocking dialog...");
       showPasteBlockDialog(
         result.clipboardText,
         result.detection.type,
-        "Unknown", // App name not needed for static blocking
-          () => {
-            allowPasteTemporarily(60);
-            isBlockingPaste = false;
-            if (result.clipboardText) {
-              setTimeout(() => clipboard.writeText(result.clipboardText), 100);
-            }
-          },
-          () => {
-            if (result.clipboardText) {
-              clipboard.writeText(encryptForSharing(result.clipboardText));
-            }
-            isBlockingPaste = false;
+        "Unknown",
+        () => {
+          allowPasteTemporarily(60);
+          isBlockingPaste = false;
+          if (result.clipboardText) {
+            setTimeout(() => clipboard.writeText(result.clipboardText), 100);
           }
+        },
+        () => {
+          if (result.clipboardText) {
+            clipboard.writeText(encryptForSharing(result.clipboardText));
+          }
+          isBlockingPaste = false;
+        }
       );
+      console.log("   Dialog should be visible now");
+    } else {
+      console.log("   Not blocking - allowing paste");
     }
   });
   if (ctrlSuccess) {
