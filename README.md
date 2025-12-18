@@ -107,12 +107,34 @@ npm run make
    ```
 
 2. **Create a release**:
+   
+   **For files under 25 MB** (web interface):
    - Go to your repository on GitHub
    - Click "Releases" → "Create a new release"
    - Tag version (e.g., `v1.0.0`)
-   - Upload all installer files from `out/make/`
+   - Upload installer files from `out/make/`
    - Add release notes
    - Publish the release
+   
+   **For files over 25 MB** (use GitHub CLI - recommended):
+   ```bash
+   # Install GitHub CLI (if not installed)
+   brew install gh
+   
+   # Authenticate
+   gh auth login
+   
+   # Create release (easiest way)
+   ./scripts/create-release.sh v1.0.0
+   
+   # Or manually
+   gh release create v1.0.0 \
+     --title "v1.0.0" \
+     --notes "Release notes here" \
+     out/make/secret-guardian-1.0.0-arm64.dmg
+   ```
+   
+   See `RELEASE.md` for detailed instructions.
 
 3. **Share the link**: Users can download from `https://github.com/YOUR_USERNAME/secret-guardian/releases`
 
@@ -218,4 +240,12 @@ MIT
 ## Contributing
 
 Contributions welcome! Please feel free to submit a Pull Request.
+
+## 🏆 Hackathon Roadmap
+
+Want to make this project hackathon-winning? Check out **[HACKATHON_ROADMAP.md](HACKATHON_ROADMAP.md)** for:
+- Advanced feature ideas
+- Implementation priorities
+- Presentation tips
+- Winning strategies
 

@@ -1,12 +1,12 @@
 cask "secret-guardian" do
   version "1.0.0"
-  sha256 :no_check
+  sha256 "5b3fb121d01314696142e2d27771e158da11135dfc752b19a8e512abcba61f85"
 
-  url "https://github.com/YOUR_USERNAME/secret-guardian/releases/download/v#{version}/secret-guardian-#{version}-arm64.dmg",
-      verified: "github.com/YOUR_USERNAME/secret-guardian/"
+  url "https://github.com/prakash912/secret-guardian/releases/download/v#{version}/secret-guardian-#{version}-arm64.dmg",
+      verified: "github.com/prakash912/secret-guardian/"
   name "Secret Guardian"
   desc "Desktop app that monitors your clipboard and alerts you when you copy sensitive data"
-  homepage "https://github.com/YOUR_USERNAME/secret-guardian"
+  homepage "https://github.com/prakash912/secret-guardian"
 
   livecheck do
     url :url

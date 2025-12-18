@@ -4,35 +4,49 @@ This directory contains configuration files for distributing Secret Guardian thr
 
 ## Homebrew (macOS)
 
-### Setup Instructions
+### Quick Setup (Automated)
 
-1. **Fork the Homebrew Cask repository** (if you want to maintain your own tap):
-   ```bash
-   brew tap YOUR_USERNAME/homebrew-cask
-   ```
+**Option 1: Use the setup script (Easiest)**
+```bash
+./packaging/homebrew/setup-tap.sh
+```
+
+This script will:
+- Create a GitHub repository for your tap
+- Set up the cask file (already configured with your info)
+- Create a README
+- Push everything to GitHub
+
+### Manual Setup
+
+See the complete guide: **[homebrew/HOMEBREW_SETUP.md](homebrew/HOMEBREW_SETUP.md)**
+
+**Quick steps:**
+1. **Create your own tap** (recommended):
+   - Create a GitHub repo named `homebrew-cask`
+   - Copy `Casks/secret-guardian.rb` to the repo
+   - Users install with: `brew tap prakash912/homebrew-cask && brew install --cask secret-guardian`
 
 2. **Or submit to official Homebrew Cask**:
    - Fork https://github.com/Homebrew/homebrew-cask
-   - Add your cask file to `Casks/secret-guardian.rb`
+   - Add your cask file
    - Submit a pull request
 
-3. **Update the cask file**:
-   - Replace `YOUR_USERNAME` with your GitHub username
-   - Update the download URL to point to your releases
-   - Calculate SHA256 checksum: `shasum -a 256 secret-guardian-1.0.0-arm64.dmg`
+**The cask file is already configured** with:
+- ✅ Correct GitHub username (prakash912)
+- ✅ SHA256 checksum
+- ✅ Download URL
+- ✅ Auto-update support
 
-4. **Test locally**:
-   ```bash
-   brew install --cask packaging/homebrew/Casks/secret-guardian.rb
-   ```
+**Users install with:**
+```bash
+# If using your tap:
+brew tap prakash912/homebrew-cask
+brew install --cask secret-guardian
 
-5. **Users install with**:
-   ```bash
-   brew install --cask secret-guardian
-   # Or if using your tap:
-   brew tap YOUR_USERNAME/homebrew-cask
-   brew install --cask secret-guardian
-   ```
+# If accepted to official Homebrew:
+brew install --cask secret-guardian
+```
 
 ## Chocolatey (Windows)
 
