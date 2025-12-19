@@ -4,7 +4,7 @@ import fs from "fs";
 import { detectSecrets } from "./detectSecrets";
 import { getConfig, updateConfig, AVAILABLE_APPS } from "./config";
 import { addToHistory, getHistory, clearHistory } from "./clipboardHistory";
-import { showPasteBlockDialog, allowPasteTemporarily, clearCurrentSecret, registerRedactedPasteHotkey, unregisterPasteInterception, cleanupBlockingDialog, showDecryptDialog, closeDecryptDialog, closeBlockingDialog, isPasteAllowed, setUserAllowedPasteFlag, getBlockingWindow, getDecryptWindow } from "./pasteBlocker";
+import { showPasteBlockDialog, allowPasteTemporarily, clearCurrentSecret, registerRedactedPasteHotkey, unregisterPasteInterception, cleanupBlockingDialog, showDecryptDialog, closeDecryptDialog, closeBlockingDialog, isPasteAllowed, setUserAllowedPasteFlag, setUserEncryptedFlag, getBlockingWindow, getDecryptWindow } from "./pasteBlocker";
 import { encryptForSharing, decryptShared, isEncryptedShared, getActiveAppName, isAppAllowed } from "./utils";
 
 app.setAppUserModelId("com.secretguardian.app");
@@ -65,8 +65,10 @@ function updateTrayMenu() {
         {
           label: "Allow Paste for 60s",
           click: () => {
-            allowPasteTemporarily(60);
-            updateTrayMenu();
+            if (currentSecret) {
+              allowPasteTemporarily(currentSecret, 60);
+              updateTrayMenu();
+            }
           }
         }
       ] : [
@@ -345,12 +347,12 @@ function startPasteMonitoring() {
           // Check if it's a secret
           const detection = detectSecrets(text);
           if (detection.detected) {
-            // Check if paste is temporarily allowed (don't show popup if allowed)
-            if (isPasteAllowed()) {
-              console.log("ℹ️ Paste is temporarily allowed - skipping popup");
+            // Check if paste is temporarily allowed for THIS SPECIFIC secret (don't show popup if it's the allowed one)
+            if (isPasteAllowed(text)) {
+              console.log("ℹ️ Paste is temporarily allowed for this specific secret - skipping popup");
               addToHistory(text, true, detection.type, appName);
               updateTrayMenu();
-              return; // Don't show popup if paste is allowed
+              return; // Don't show popup if this specific secret is allowed
             }
             
             // Check if app is allowed - if so, don't show popup
@@ -384,9 +386,9 @@ function startPasteMonitoring() {
               detection.type,
               appName,
               () => {
-                // Allow option - allow paste for 60s
+                // Allow option - allow paste for 60s for this specific secret
                 // Note: Dialog will be closed by the IPC handler
-                allowPasteTemporarily(60);
+                allowPasteTemporarily(text, 60);
               },
               () => {
                 // Encrypt option - replace clipboard with encrypted version
@@ -541,17 +543,17 @@ app.whenReady().then(() => {
       if (currentSecret) {
         clipboard.writeText(currentSecret);
         console.log(`✅ Secret kept in clipboard (${currentSecret.length} chars, will auto-clear in 60s)`);
+        
+        // Set timer to auto-clear clipboard after 60 seconds for THIS SPECIFIC secret
+        allowPasteTemporarily(currentSecret, 60);
+        console.log("✅ Paste allowed for 60 seconds for this specific secret - clipboard will auto-clear after 60s");
       }
-      
-      // Set timer to auto-clear clipboard after 60 seconds
-      allowPasteTemporarily(60);
-      console.log("✅ Paste allowed for 60 seconds - clipboard will auto-clear after 60s");
       
       // Show notification
       if (Notification.isSupported()) {
         new Notification({
           title: "✅ Paste Allowed",
-          body: "You can paste this secret for the next 60 seconds. It will auto-clear after that."
+          body: "You can paste this specific secret for the next 60 seconds. Other secrets will still trigger warnings. It will auto-clear after 60s."
         }).show();
       }
       
@@ -559,21 +561,24 @@ app.whenReady().then(() => {
       closeBlockingDialog();
     } else if (action === "encrypt") {
       if (currentSecret) {
-        // Replace clipboard with encrypted version (original secret is gone)
+        // Replace clipboard with encrypted version (with SG_ENCRYPTED: prefix)
         const encrypted = encryptForSharing(currentSecret);
         clipboard.writeText(encrypted);
-        console.log("✅ Original secret replaced with encrypted version - original is cleared");
+        console.log("✅ Original secret replaced with encrypted version (SG_ENCRYPTED:) - encrypted key stays in clipboard");
+        
+        // Set flag so clipboard won't be cleared when dialog closes
+        setUserEncryptedFlag(true);
         
         // Clear the original secret reference
         currentSecret = null;
         
-        // Close the dialog
+        // Close the dialog (clipboard will NOT be cleared since flag is set)
         closeBlockingDialog();
         
         if (Notification.isSupported()) {
           new Notification({
             title: "✅ Encrypted Secret Copied",
-            body: "Encrypted secret is in clipboard. Original secret has been cleared and cannot be pasted."
+            body: "Encrypted secret (SG_ENCRYPTED:) is in clipboard and will not be cleared."
           }).show();
         }
       }

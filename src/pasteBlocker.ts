@@ -4,9 +4,11 @@ import { redactSecret, encryptForSharing } from "./utils";
 // State variables
 let currentSecret: string | null = null;
 let allowPasteUntil = 0;
+let allowedSecret: string | null = null; // Track which specific secret was allowed for 60s
 let blockedWindow: BrowserWindow | null = null;
 let decryptWindow: BrowserWindow | null = null;
 let userAllowedPasteFlag = false; // Flag to track if user clicked "Allow for 60s"
+let userEncryptedFlag = false; // Flag to track if user clicked "Encrypt & Copy"
 let autoClearTimer: NodeJS.Timeout | null = null; // Timer to auto-clear clipboard after 60s
 
 /**
@@ -14,6 +16,13 @@ let autoClearTimer: NodeJS.Timeout | null = null; // Timer to auto-clear clipboa
  */
 export function setUserAllowedPasteFlag(value: boolean): void {
   userAllowedPasteFlag = value;
+}
+
+/**
+ * Set flag that user encrypted secret (don't clear clipboard on close)
+ */
+export function setUserEncryptedFlag(value: boolean): void {
+  userEncryptedFlag = value;
 }
 
 export function setCurrentSecret(secret: string): void {
@@ -293,9 +302,6 @@ export function showPasteBlockDialog(
           <button class="btn-allow" onclick="window.allow()">
             <span class="button-text">⏱️ Allow for 60s</span>
           </button>
-          <button class="btn-close" onclick="window.closeDialog()">
-            <span class="button-text">Close</span>
-          </button>
         </div>
       </div>
       <script>
@@ -344,17 +350,31 @@ export function showPasteBlockDialog(
     }
   });
 
-  // Reset flag when creating new dialog
+  // Reset flags when creating new dialog
   userAllowedPasteFlag = false;
+  userEncryptedFlag = false;
   
   // Handle window close
   blockedWindow.on("closed", () => {
     blockedWindow = null;
     
-    // CRITICAL: Clear clipboard when dialog closes UNLESS user clicked "Allow for 60s"
+    // Check if clipboard contains encrypted key (SG_ENCRYPTED:)
+    let clipboardHasEncrypted = false;
+    try {
+      const clipboardText = clipboard.readText();
+      if (clipboardText && clipboardText.startsWith("SG_ENCRYPTED:")) {
+        clipboardHasEncrypted = true;
+      }
+    } catch (error) {
+      // Clipboard might be empty or inaccessible
+    }
+    
+    // CRITICAL: Clear clipboard when dialog closes UNLESS:
+    // 1. User clicked "Allow for 60s" (userAllowedPasteFlag)
+    // 2. User clicked "Encrypt & Copy" (userEncryptedFlag or clipboardHasEncrypted)
     // This ensures secret is cleared whether copied from keyboard or mouse
     // Once cleared, NO ONE can paste it (neither keyboard Cmd+V/Ctrl+V nor mouse paste)
-    if (!userAllowedPasteFlag) {
+    if (!userAllowedPasteFlag && !userEncryptedFlag && !clipboardHasEncrypted) {
       try {
         // Clear clipboard immediately
         clipboard.clear();
@@ -383,15 +403,26 @@ export function showPasteBlockDialog(
         console.error("Error clearing clipboard:", error);
       }
     } else {
-      console.log("ℹ️ Clipboard NOT cleared - user allowed paste for 60s (will auto-clear after 60s)");
-      userAllowedPasteFlag = false; // Reset flag (but allowPasteUntil is still active for auto-clear)
+      if (userAllowedPasteFlag) {
+        console.log("ℹ️ Clipboard NOT cleared - user allowed paste for 60s (will auto-clear after 60s)");
+        userAllowedPasteFlag = false; // Reset flag (but allowPasteUntil is still active for auto-clear)
+      } else if (userEncryptedFlag || clipboardHasEncrypted) {
+        console.log("ℹ️ Clipboard NOT cleared - encrypted key (SG_ENCRYPTED:) is in clipboard");
+        userEncryptedFlag = false; // Reset flag
+      }
     }
     
-    // Don't clear currentSecret if paste is allowed - user might need it
-    if (!isPasteAllowed()) {
-      currentSecret = null; // Only clear if paste is not allowed
+    // Don't clear currentSecret if paste is allowed for this secret - user might need it
+    try {
+      const clipboardText = clipboard.readText();
+      if (!isPasteAllowed(clipboardText)) {
+        currentSecret = null; // Only clear if paste is not allowed for this secret
+      }
+    } catch (error) {
+      currentSecret = null; // Clear if we can't check
     }
-    console.log(`Dialog closed - paste allowed: ${isPasteAllowed()}, time remaining: ${Math.max(0, Math.floor((allowPasteUntil - Date.now()) / 1000))}s`);
+    const timeRemaining = Math.max(0, Math.floor((allowPasteUntil - Date.now()) / 1000));
+    console.log(`Dialog closed - paste allowed for specific secret: ${allowedSecret ? true : false}, time remaining: ${timeRemaining}s`);
   });
   
   console.log("✅ Dialog setup complete - should be visible");
@@ -652,13 +683,30 @@ export function showDecryptDialog(): void {
  */
 export function closeBlockingDialog(): void {
   if (blockedWindow) {
-    // Ensure clipboard is cleared when closing (unless user allowed for 60s)
-    if (!userAllowedPasteFlag) {
+    // Check if clipboard contains encrypted key (SG_ENCRYPTED:)
+    let clipboardHasEncrypted = false;
+    try {
+      const clipboardText = clipboard.readText();
+      if (clipboardText && clipboardText.startsWith("SG_ENCRYPTED:")) {
+        clipboardHasEncrypted = true;
+      }
+    } catch (error) {
+      // Clipboard might be empty or inaccessible
+    }
+    
+    // Ensure clipboard is cleared when closing UNLESS:
+    // 1. User allowed paste for 60s (userAllowedPasteFlag)
+    // 2. User encrypted the secret (userEncryptedFlag or clipboardHasEncrypted)
+    if (!userAllowedPasteFlag && !userEncryptedFlag && !clipboardHasEncrypted) {
       try {
         clipboard.clear();
         console.log("✅ Clipboard cleared immediately before closing dialog");
       } catch (error) {
         console.error("Error clearing clipboard:", error);
+      }
+    } else {
+      if (userEncryptedFlag || clipboardHasEncrypted) {
+        console.log("ℹ️ Clipboard NOT cleared - encrypted key (SG_ENCRYPTED:) is in clipboard");
       }
     }
     
@@ -676,10 +724,15 @@ export function closeDecryptDialog(): void {
 
 /**
  * Allow paste temporarily - keeps secret in clipboard for specified seconds, then auto-clears
+ * @param secret The specific secret content that is allowed (only this secret will be allowed)
+ * @param seconds Number of seconds to allow paste
  */
-export function allowPasteTemporarily(seconds = 60): void {
+export function allowPasteTemporarily(secret: string, seconds = 60): void {
   allowPasteUntil = Date.now() + seconds * 1000;
+  allowedSecret = secret; // Store the specific secret that was allowed
   userAllowedPasteFlag = true; // Set flag so clipboard won't be cleared on dialog close
+  
+  console.log(`✅ Allowing paste for specific secret (${secret.length} chars) for ${seconds} seconds`);
   
   // Clear any existing timer
   if (autoClearTimer) {
@@ -689,38 +742,45 @@ export function allowPasteTemporarily(seconds = 60): void {
   // Set timer to auto-clear clipboard after the specified time
   autoClearTimer = setTimeout(() => {
     try {
-      clipboard.clear();
-      console.log(`✅ Clipboard auto-cleared after ${seconds} seconds - secret removed from everywhere`);
-      
-      // Clear multiple times to ensure it's completely cleared
-      setTimeout(() => {
-        try {
-          clipboard.clear();
-          console.log("✅ Clipboard cleared again (double-check)");
-        } catch (e) {
-          // Ignore
-        }
-      }, 50);
-      
-      setTimeout(() => {
-        try {
-          clipboard.clear();
-          console.log("✅ Clipboard cleared final time (triple-check)");
-        } catch (e) {
-          // Ignore
-        }
-      }, 200);
+      // Only clear if the clipboard still contains the allowed secret
+      const currentClipboard = clipboard.readText();
+      if (currentClipboard === allowedSecret) {
+        clipboard.clear();
+        console.log(`✅ Clipboard auto-cleared after ${seconds} seconds - secret removed from everywhere`);
+        
+        // Clear multiple times to ensure it's completely cleared
+        setTimeout(() => {
+          try {
+            clipboard.clear();
+            console.log("✅ Clipboard cleared again (double-check)");
+          } catch (e) {
+            // Ignore
+          }
+        }, 50);
+        
+        setTimeout(() => {
+          try {
+            clipboard.clear();
+            console.log("✅ Clipboard cleared final time (triple-check)");
+          } catch (e) {
+            // Ignore
+          }
+        }, 200);
+      } else {
+        console.log("ℹ️ Clipboard contains different content - not clearing (user copied something else)");
+      }
       
       // Reset flags
       userAllowedPasteFlag = false;
       allowPasteUntil = 0;
+      allowedSecret = null;
       currentSecret = null;
       
       // Show notification
       if (Notification.isSupported()) {
         new Notification({
           title: "🔒 Secret Auto-Cleared",
-          body: "The secret has been automatically cleared from clipboard after 60 seconds"
+          body: "The allowed secret has been automatically cleared from clipboard after 60 seconds"
         }).show();
       }
     } catch (error) {
@@ -734,10 +794,28 @@ export function allowPasteTemporarily(seconds = 60): void {
 }
 
 /**
- * Check if paste is currently allowed (temporarily)
+ * Check if paste is currently allowed (temporarily) for a specific secret
+ * @param secret The secret content to check (optional - if not provided, checks clipboard)
+ * @returns true if paste is allowed for this specific secret
  */
-export function isPasteAllowed(): boolean {
-  return Date.now() < allowPasteUntil;
+export function isPasteAllowed(secret?: string): boolean {
+  // If no time limit set, paste is not allowed
+  if (Date.now() >= allowPasteUntil || !allowedSecret) {
+    return false;
+  }
+  
+  // If secret is provided, check if it matches the allowed secret
+  if (secret !== undefined) {
+    return secret === allowedSecret;
+  }
+  
+  // If no secret provided, check clipboard content
+  try {
+    const clipboardText = clipboard.readText();
+    return clipboardText === allowedSecret;
+  } catch (error) {
+    return false;
+  }
 }
 
 /**
