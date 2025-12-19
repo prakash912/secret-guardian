@@ -10,7 +10,7 @@ export interface AppRule {
 }
 
 export interface UserConfig {
-  safePasteMode: boolean;
+  safeCopyMode: boolean;
   allowedApps: string[]; // App names that are always allowed
   blockedApps: string[]; // App names that are always blocked
   appRules: AppRule[];
@@ -70,7 +70,7 @@ export const AVAILABLE_PATTERNS = [
 ];
 
 const DEFAULT_CONFIG: UserConfig = {
-  safePasteMode: true,
+  safeCopyMode: true,
   allowedApps: [
     "Visual Studio Code",
     "Code",
@@ -115,6 +115,15 @@ export function loadConfig(): UserConfig {
     if (fs.existsSync(CONFIG_PATH)) {
       const data = fs.readFileSync(CONFIG_PATH, "utf-8");
       const config = JSON.parse(data);
+      
+      // Migration: Convert safePasteMode to safeCopyMode
+      if (config.safePasteMode !== undefined && config.safeCopyMode === undefined) {
+        config.safeCopyMode = config.safePasteMode;
+        delete config.safePasteMode;
+        // Save migrated config
+        saveConfig({ ...DEFAULT_CONFIG, ...config });
+      }
+      
       return { ...DEFAULT_CONFIG, ...config };
     }
   } catch (error) {

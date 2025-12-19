@@ -207,34 +207,93 @@ let lastLoggedApp: string | null = null;
 let lastLoggedResult: boolean | null = null;
 
 /**
+ * Normalize app name for matching - handles variations and abbreviations
+ */
+function normalizeAppNameForMatching(name: string): string {
+  let normalized = name.trim();
+  
+  // Remove .app extension
+  if (normalized.endsWith('.app')) {
+    normalized = normalized.slice(0, -4);
+  }
+  
+  // Convert to lowercase
+  normalized = normalized.toLowerCase();
+  
+  // Remove common words that don't help with matching
+  normalized = normalized.replace(/\s+/g, ' ').trim();
+  
+  // Handle common abbreviations and variations
+  const variations: Record<string, string> = {
+    'msteams': 'microsoft teams',
+    'ms teams': 'microsoft teams',
+    'teams': 'microsoft teams',
+    'vscode': 'visual studio code',
+    'vs code': 'visual studio code',
+    'code': 'visual studio code',
+    'chrome': 'google chrome',
+    'gmail': 'gmail',
+    'slack': 'slack',
+    'discord': 'discord',
+  };
+  
+  // Check if normalized name matches any variation
+  for (const [abbrev, full] of Object.entries(variations)) {
+    if (normalized === abbrev || normalized.includes(abbrev)) {
+      normalized = full;
+      break;
+    }
+    if (normalized.includes(full) || full.includes(normalized)) {
+      normalized = full;
+      break;
+    }
+  }
+  
+  return normalized;
+}
+
+/**
  * Check if app is in allowed/blocked list
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export function isAppAllowed(appName: string, config: any): boolean {
-  const lowerName = appName.toLowerCase();
+  // Normalize app name
+  const normalizedAppName = normalizeAppNameForMatching(appName);
   
   // Check blocked apps first (most restrictive)
   for (const blocked of config.blockedApps || []) {
-    if (lowerName.includes(blocked.toLowerCase())) {
+    const normalizedBlocked = normalizeAppNameForMatching(blocked);
+    
+    // Try multiple matching strategies
+    if (normalizedAppName === normalizedBlocked || 
+        normalizedAppName.includes(normalizedBlocked) || 
+        normalizedBlocked.includes(normalizedAppName)) {
+      console.log(`   🚫 App "${appName}" matched blocked app "${blocked}"`);
       return false;
     }
   }
   
   // Check allowed apps (explicit allow)
   for (const allowed of config.allowedApps || []) {
-    if (lowerName.includes(allowed.toLowerCase())) {
+    const normalizedAllowed = normalizeAppNameForMatching(allowed);
+    
+    // Try multiple matching strategies
+    if (normalizedAppName === normalizedAllowed || 
+        normalizedAppName.includes(normalizedAllowed) || 
+        normalizedAllowed.includes(normalizedAppName)) {
+      console.log(`   ✅ App "${appName}" matched allowed app "${allowed}"`);
       return true;
     }
   }
   
-  // Default behavior: if safe paste mode is OFF, allow everything
-  // If safe paste mode is ON, block by default (unless explicitly allowed)
-  const defaultAllow = !config.safePasteMode;
+  // Default behavior: if safe copy mode is OFF, allow everything
+  // If safe copy mode is ON, block by default (unless explicitly allowed)
+  const defaultAllow = !config.safeCopyMode;
   // Only log when app or result changes (to help with debugging)
   if (lastLoggedApp !== appName || lastLoggedResult !== defaultAllow) {
     // Only log if it's a blocked app (more important to know)
     if (!defaultAllow) {
-      console.log(`   App "${appName}" not in lists - default: BLOCK (safe paste mode: ON)`);
+      console.log(`   ⚠️ App "${appName}" not in lists - default: BLOCK (Safe Copy Mode: ON)`);
     }
     lastLoggedApp = appName;
     lastLoggedResult = defaultAllow;

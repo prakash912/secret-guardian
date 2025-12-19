@@ -1,72 +1,19 @@
 import { clipboard, globalShortcut, BrowserWindow, Notification } from "electron";
-import { exec } from "child_process";
-import { getActiveAppName, isAppAllowed, redactSecret, matchesIgnorePattern, encryptForSharing, decryptShared } from "./utils";
-import { getConfig } from "./config";
-import { detectSecrets } from "./detectSecrets";
+import { redactSecret, encryptForSharing } from "./utils";
 
-/**
- * Trigger paste in the currently focused application
- * Works for both Electron windows and native macOS apps
- */
-async function triggerPaste(): Promise<void> {
-  const focusedWindow = BrowserWindow.getFocusedWindow();
-  
-  if (focusedWindow) {
-    // Electron window - use webContents.paste()
-    try {
-      focusedWindow.webContents.paste();
-      console.log("   ✅ Triggered paste in Electron window");
-    } catch (error) {
-      console.error("   ❌ Failed to paste in Electron window:", error);
-    }
-  } else {
-    // Native macOS app - use AppleScript to trigger paste
-    if (process.platform === "darwin") {
-      try {
-        // Use AppleScript to send Cmd+V to the frontmost application
-        // Use a more reliable approach with delay
-        const script = 'tell application "System Events" to keystroke "v" using command down';
-        exec(`osascript -e '${script}'`, (error, stdout, stderr) => {
-          if (error) {
-            console.error("   ❌ Failed to trigger paste via AppleScript:", error.message);
-            console.error("   ⚠️  Make sure Secret Guardian has Accessibility permissions in System Settings");
-          } else {
-            console.log("   ✅ Triggered paste via AppleScript");
-          }
-        });
-      } catch (error) {
-        console.error("   ❌ Error executing AppleScript:", error);
-      }
-    } else {
-      // For other platforms, try to find and focus an Electron window
-      const windows = BrowserWindow.getAllWindows();
-      if (windows.length > 0) {
-        try {
-          windows[0].webContents.paste();
-          console.log("   ✅ Triggered paste in Electron window (fallback)");
-        } catch (error) {
-          console.error("   ❌ Failed to paste in Electron window:", error);
-        }
-      }
-    }
-  }
-}
-
+// State variables
 let currentSecret: string | null = null;
 let allowPasteUntil = 0;
 let blockedWindow: BrowserWindow | null = null;
-let pasteInterceptRegistered = false;
-let isBlockingPaste = false; // Flag to prevent duplicate blocking from multiple systems
-let lastBlockedPasteTime = 0;
-const BLOCK_COOLDOWN = 1000; // 1 second cooldown between blocking attempts
+let decryptWindow: BrowserWindow | null = null;
+let userAllowedPasteFlag = false; // Flag to track if user clicked "Allow for 60s"
+let autoClearTimer: NodeJS.Timeout | null = null; // Timer to auto-clear clipboard after 60s
 
-// Export getters/setters for mouse paste detection
-export function getIsBlockingPaste(): boolean {
-  return isBlockingPaste;
-}
-
-export function getLastBlockedPasteTime(): number {
-  return lastBlockedPasteTime;
+/**
+ * Set flag that user allowed paste (don't clear clipboard on close)
+ */
+export function setUserAllowedPasteFlag(value: boolean): void {
+  userAllowedPasteFlag = value;
 }
 
 export function setCurrentSecret(secret: string): void {
@@ -74,112 +21,7 @@ export function setCurrentSecret(secret: string): void {
 }
 
 /**
- * Check if we should block a paste operation
- */
-export async function shouldBlockPaste(clipboardText: string): Promise<{
-  shouldBlock: boolean;
-  reason?: string;
-  appName?: string;
-}> {
-  const config = getConfig();
-
-  if (!config.safePasteMode) {
-    return { shouldBlock: false };
-  }
-
-  // Check ignore patterns
-  for (const pattern of config.ignorePatterns) {
-    if (matchesIgnorePattern(clipboardText, pattern)) {
-      return { shouldBlock: false };
-    }
-  }
-
-  // Detect if it's a secret
-  const detection = detectSecrets(clipboardText);
-  if (!detection.detected) {
-    return { shouldBlock: false };
-  }
-
-  // Check if paste is temporarily allowed
-  if (Date.now() < allowPasteUntil) {
-    return { shouldBlock: false };
-  }
-
-  // Get active app
-  const appName = await getActiveAppName();
-
-  // Check app rules
-  const allowed = isAppAllowed(appName, config);
-
-  if (!allowed) {
-    currentSecret = clipboardText;
-    return {
-      shouldBlock: true,
-      reason: `Pasting ${detection.type} into ${appName} is blocked`,
-      appName,
-    };
-  }
-
-  return { shouldBlock: false };
-}
-
-/**
- * SIMPLE & FAST: Check if we should block paste
- * Static logic: If it's a secret → block it (everywhere)
- * No app checks, no patterns - just secret detection
- */
-function shouldBlockPasteSync(): {
-  shouldBlock: boolean;
-  detection?: { type: string };
-  clipboardText?: string;
-  appName?: string;
-} {
-  const config = getConfig();
-
-  // Fast exit checks
-  if (!config.safePasteMode) {
-    return { shouldBlock: false };
-  }
-
-  if (Date.now() < allowPasteUntil) {
-    return { shouldBlock: false };
-  }
-
-  // Read clipboard
-  let clipboardText: string;
-  try {
-    clipboardText = clipboard.readText().trim();
-  } catch {
-    return { shouldBlock: false };
-  }
-
-  // Fast length check
-  if (!clipboardText || clipboardText.length < 8) {
-    return { shouldBlock: false };
-  }
-
-  // CRITICAL: NEVER block encrypted keys - they're safe
-  if (clipboardText.startsWith("SG_ENCRYPTED:")) {
-    return { shouldBlock: false };
-  }
-
-  // Detect if it's a secret
-  const detection = detectSecrets(clipboardText);
-  if (!detection.detected) {
-    return { shouldBlock: false }; // Not a secret - allow
-  }
-
-  // STATIC: If it's a secret → always block (no app checks, no patterns)
-  return {
-    shouldBlock: true,
-    detection,
-    clipboardText,
-    appName: "Unknown", // Not used for blocking decision
-  };
-}
-
-/**
- * Show paste blocking dialog
+ * Show secret detection dialog (shows on copy when Safe Copy Mode is ON)
  */
 let lastDialogTime = 0;
 const DIALOG_COOLDOWN = 2000; // 2 seconds between dialogs
@@ -212,8 +54,6 @@ export function showPasteBlockDialog(
   }
   
   lastDialogTime = now;
-  lastBlockedPasteTime = now;
-  isBlockingPaste = true;
   
   console.log("   Creating dialog window...");
 
@@ -225,27 +65,19 @@ export function showPasteBlockDialog(
   // Prepare redacted secret for display (before creating window)
   const redacted = redactSecret(secret);
 
-  // Create a blocking window
-  if (blockedWindow) {
-    try {
-      blockedWindow.close();
-    } catch (error) {
-      // Ignore errors when closing old window
-    }
-    blockedWindow = null;
-  }
-
   console.log(`📱 Creating paste block dialog for ${secretType} in ${appName}`);
 
   try {
     blockedWindow = new BrowserWindow({
-      width: 600,
+      width: 520,
       height: 500,
       frame: false,
       alwaysOnTop: true,
       resizable: false,
       skipTaskbar: true,
       show: true, // Show IMMEDIATELY - don't wait for ready-to-show
+      modal: true, // Make it modal - blocks all background interaction
+      backgroundColor: '#667eea', // Match gradient start color
       webPreferences: {
         nodeIntegration: true,
         contextIsolation: false,
@@ -260,6 +92,9 @@ export function showPasteBlockDialog(
       blockedWindow.focus();
       blockedWindow.moveTop();
       blockedWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+      
+      // Make sure it's on top and blocks all interaction
+      blockedWindow.setAlwaysOnTop(true, 'screen-saver', 1);
     }
     
     // Also handle ready-to-show as backup
@@ -282,81 +117,185 @@ export function showPasteBlockDialog(
     <!DOCTYPE html>
     <html>
     <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
       <style>
+        * {
+          box-sizing: border-box;
+        }
         body {
-          font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+          font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
           margin: 0;
-          padding: 20px;
+          padding: 0;
           background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
           color: white;
+          overflow: hidden;
         }
         .container {
+          width: 100%;
+          padding: 30px 30px 15px 30px;
           text-align: center;
+          box-sizing: border-box;
+          display: flex;
+          flex-direction: column;
         }
-        h2 { margin-top: 0; }
+        .icon {
+          font-size: 48px;
+          margin-bottom: 16px;
+          animation: pulse 2s ease-in-out infinite;
+        }
+        @keyframes pulse {
+          0%, 100% { transform: scale(1); }
+          50% { transform: scale(1.1); }
+        }
+        h2 {
+          margin: 0 0 12px 0;
+          font-size: 28px;
+          font-weight: 700;
+          letter-spacing: -0.5px;
+        }
+        .subtitle {
+          margin: 0 0 8px 0;
+          font-size: 16px;
+          opacity: 0.95;
+          font-weight: 500;
+        }
+        .secret-type {
+          display: inline-block;
+          background: rgba(255,255,255,0.25);
+          padding: 6px 14px;
+          border-radius: 20px;
+          font-size: 13px;
+          font-weight: 600;
+          margin: 8px 0;
+          backdrop-filter: blur(10px);
+        }
+        .description {
+          margin: 16px 0 20px 0;
+          font-size: 14px;
+          opacity: 0.9;
+          line-height: 1.5;
+        }
         .secret-preview {
-          background: rgba(255,255,255,0.2);
-          padding: 15px;
-          border-radius: 8px;
+          background: rgba(0,0,0,0.3);
+          padding: 16px;
+          border-radius: 12px;
           margin: 20px 0;
-          font-family: monospace;
+          font-family: 'SF Mono', 'Monaco', 'Cascadia Code', 'Roboto Mono', monospace;
+          font-size: 13px;
           word-break: break-all;
+          line-height: 1.6;
+          border: 1px solid rgba(255,255,255,0.1);
+          backdrop-filter: blur(10px);
+          box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+          max-height: 140px;
+          overflow-y: auto;
+          flex-shrink: 1;
+        }
+        .secret-preview::-webkit-scrollbar {
+          width: 6px;
+        }
+        .secret-preview::-webkit-scrollbar-track {
+          background: rgba(255,255,255,0.1);
+          border-radius: 3px;
+        }
+        .secret-preview::-webkit-scrollbar-thumb {
+          background: rgba(255,255,255,0.3);
+          border-radius: 3px;
+        }
+        .secret-preview::-webkit-scrollbar-thumb:hover {
+          background: rgba(255,255,255,0.5);
         }
         .buttons {
           display: flex;
+          flex-direction: column;
           gap: 10px;
-          justify-content: center;
           margin-top: 20px;
-          flex-wrap: wrap;
+          margin-bottom: 0;
+          flex-shrink: 0;
         }
         button {
-          padding: 12px 24px;
+          padding: 14px 24px;
           border: none;
-          border-radius: 6px;
-          font-size: 14px;
+          border-radius: 10px;
+          font-size: 15px;
           font-weight: 600;
           cursor: pointer;
-          transition: transform 0.2s;
+          transition: all 0.2s ease;
+          box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+          position: relative;
+          overflow: hidden;
+        }
+        button::before {
+          content: '';
+          position: absolute;
+          top: 50%;
+          left: 50%;
+          width: 0;
+          height: 0;
+          border-radius: 50%;
+          background: rgba(255,255,255,0.3);
+          transform: translate(-50%, -50%);
+          transition: width 0.6s, height 0.6s;
+        }
+        button:hover::before {
+          width: 300px;
+          height: 300px;
         }
         button:hover {
-          transform: scale(1.05);
+          transform: translateY(-2px);
+          box-shadow: 0 6px 20px rgba(0,0,0,0.25);
         }
-        .btn-reveal {
-          background: #f59e0b;
-          color: white;
-        }
-        .btn-redact {
-          background: #10b981;
-          color: white;
-        }
-        .btn-allow {
-          background: #3b82f6;
-          color: white;
+        button:active {
+          transform: translateY(0);
+          box-shadow: 0 2px 8px rgba(0,0,0,0.2);
         }
         .btn-encrypt {
-          background: #8b5cf6;
+          background: linear-gradient(135deg, #8b5cf6 0%, #7c3aed 100%);
           color: white;
         }
-        .btn-decrypt {
-          background: #ec4899;
+        .btn-encrypt:hover {
+          background: linear-gradient(135deg, #9d6af7 0%, #8d4ef0 100%);
+        }
+        .btn-allow {
+          background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%);
           color: white;
+        }
+        .btn-allow:hover {
+          background: linear-gradient(135deg, #4c91f7 0%, #3574ec 100%);
         }
         .btn-close {
-          background: rgba(255,255,255,0.2);
+          background: rgba(255,255,255,0.15);
           color: white;
+          border: 1px solid rgba(255,255,255,0.2);
+        }
+        .btn-close:hover {
+          background: rgba(255,255,255,0.25);
+        }
+        .button-text {
+          position: relative;
+          z-index: 1;
         }
       </style>
     </head>
     <body>
       <div class="container">
-        <h2>🚨 Secret Detected - Paste Blocked</h2>
-        <p><strong>${secretType}</strong> detected</p>
-        <p>Pasting into <strong>${appName}</strong> is blocked</p>
+        <div class="icon">🚨</div>
+        <h2>Secret Detected</h2>
+        <p class="subtitle">Security Alert</p>
+        <div class="secret-type">${secretType}</div>
+        <p class="description">You just copied a sensitive secret. Choose an action to protect it:</p>
         <div class="secret-preview">${redacted}</div>
         <div class="buttons">
-          <button class="btn-encrypt" onclick="window.encrypt()">Encrypt & Copy</button>
-          <button class="btn-allow" onclick="window.allow()">Allow for 60s</button>
-          <button class="btn-close" onclick="window.closeDialog()">Close</button>
+          <button class="btn-encrypt" onclick="window.encrypt()">
+            <span class="button-text">🔒 Encrypt & Copy</span>
+          </button>
+          <button class="btn-allow" onclick="window.allow()">
+            <span class="button-text">⏱️ Allow for 60s</span>
+          </button>
+          <button class="btn-close" onclick="window.closeDialog()">
+            <span class="button-text">Close</span>
+          </button>
         </div>
       </div>
       <script>
@@ -364,6 +303,17 @@ export function showPasteBlockDialog(
         window.encrypt = () => ipcRenderer.send('paste-action', 'encrypt');
         window.allow = () => ipcRenderer.send('paste-action', 'allow');
         window.closeDialog = () => ipcRenderer.send('close-blocking-dialog');
+        
+        // Auto-resize window to fit content
+        window.addEventListener('DOMContentLoaded', () => {
+          setTimeout(() => {
+            const container = document.querySelector('.container');
+            if (container) {
+              const height = container.scrollHeight + 5; // Minimal padding
+              ipcRenderer.send('resize-dialog', 'blocking', Math.max(400, Math.min(height, 700))); // Min 400px, max 700px
+            }
+          }, 100);
+        });
       </script>
     </body>
     </html>
@@ -394,25 +344,62 @@ export function showPasteBlockDialog(
     }
   });
 
+  // Reset flag when creating new dialog
+  userAllowedPasteFlag = false;
+  
   // Handle window close
   blockedWindow.on("closed", () => {
     blockedWindow = null;
-    isBlockingPaste = false; // Reset blocking flag when dialog closes
-    console.log("Dialog closed");
+    
+    // CRITICAL: Clear clipboard when dialog closes UNLESS user clicked "Allow for 60s"
+    // This ensures secret is cleared whether copied from keyboard or mouse
+    // Once cleared, NO ONE can paste it (neither keyboard Cmd+V/Ctrl+V nor mouse paste)
+    if (!userAllowedPasteFlag) {
+      try {
+        // Clear clipboard immediately
+        clipboard.clear();
+        console.log("✅ Clipboard cleared when dialog closed - secret removed from everywhere");
+        
+        // Clear multiple times to ensure it's completely cleared (defense in depth)
+        setTimeout(() => {
+          try {
+            clipboard.clear();
+            console.log("✅ Clipboard cleared again (double-check)");
+          } catch (e) {
+            // Ignore
+          }
+        }, 50);
+        
+        // Final clear after a short delay to catch any edge cases
+        setTimeout(() => {
+          try {
+            clipboard.clear();
+            console.log("✅ Clipboard cleared final time (triple-check)");
+          } catch (e) {
+            // Ignore
+          }
+        }, 200);
+      } catch (error) {
+        console.error("Error clearing clipboard:", error);
+      }
+    } else {
+      console.log("ℹ️ Clipboard NOT cleared - user allowed paste for 60s (will auto-clear after 60s)");
+      userAllowedPasteFlag = false; // Reset flag (but allowPasteUntil is still active for auto-clear)
+    }
+    
+    // Don't clear currentSecret if paste is allowed - user might need it
+    if (!isPasteAllowed()) {
+      currentSecret = null; // Only clear if paste is not allowed
+    }
+    console.log(`Dialog closed - paste allowed: ${isPasteAllowed()}, time remaining: ${Math.max(0, Math.floor((allowPasteUntil - Date.now()) / 1000))}s`);
   });
   
   console.log("✅ Dialog setup complete - should be visible");
-
-  // Store callbacks for IPC
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  (blockedWindow as any).pasteCallbacks = { onAllow, onEncrypt };
 }
 
 /**
  * Show decrypt dialog - standalone dialog for decrypting encrypted secrets
  */
-let decryptWindow: BrowserWindow | null = null;
-
 export function showDecryptDialog(): void {
   // Close existing dialog if open
   if (decryptWindow) {
@@ -423,17 +410,17 @@ export function showDecryptDialog(): void {
   console.log("📱 Creating decrypt dialog");
 
   decryptWindow = new BrowserWindow({
-    width: 550,
-    height: 400,
+    width: 500,
+    height: 450,
     frame: false,
     alwaysOnTop: true,
     resizable: false,
     skipTaskbar: true,
     show: false,
+    backgroundColor: '#667eea', // Match gradient start color
     webPreferences: {
       nodeIntegration: true,
       contextIsolation: false,
-      // Allow paste to work in the dialog
       enableBlinkFeatures: "ClipboardRead",
     },
   });
@@ -442,85 +429,161 @@ export function showDecryptDialog(): void {
     <!DOCTYPE html>
     <html>
     <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
       <style>
+        * {
+          box-sizing: border-box;
+        }
         body {
-          font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+          font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
           margin: 0;
-          padding: 20px;
+          padding: 0;
           background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
           color: white;
+          overflow: hidden;
         }
         .container {
+          width: 100%;
+          padding: 30px 30px 15px 30px;
           text-align: center;
+          box-sizing: border-box;
+          display: flex;
+          flex-direction: column;
         }
-        h2 { margin-top: 0; }
+        .icon {
+          font-size: 48px;
+          margin-bottom: 16px;
+          flex-shrink: 0;
+        }
+        h2 {
+          margin: 0 0 12px 0;
+          font-size: 28px;
+          font-weight: 700;
+          letter-spacing: -0.5px;
+          flex-shrink: 0;
+        }
+        .subtitle {
+          margin: 0 0 16px 0;
+          font-size: 15px;
+          opacity: 0.9;
+          line-height: 1.5;
+          flex-shrink: 0;
+        }
         .decrypt-section {
-          margin: 20px 0;
+          margin: 16px 0;
           text-align: left;
+          flex-shrink: 0;
         }
         .decrypt-input {
           width: 100%;
-          padding: 12px;
+          padding: 14px 16px;
           border: 2px solid rgba(255,255,255,0.3);
-          border-radius: 6px;
-          background: rgba(255,255,255,0.1);
+          border-radius: 10px;
+          background: rgba(0,0,0,0.2);
           color: white;
-          font-family: monospace;
-          font-size: 12px;
+          font-family: 'SF Mono', 'Monaco', 'Cascadia Code', 'Roboto Mono', monospace;
+          font-size: 13px;
           margin-top: 10px;
           box-sizing: border-box;
+          transition: all 0.2s ease;
+          backdrop-filter: blur(10px);
         }
         .decrypt-input::placeholder {
-          color: rgba(255,255,255,0.6);
+          color: rgba(255,255,255,0.5);
         }
         .decrypt-input:focus {
           outline: none;
           border-color: rgba(255,255,255,0.6);
-        }
-        .buttons {
-          display: flex;
-          gap: 10px;
-          justify-content: center;
-          margin-top: 20px;
-        }
-        button {
-          padding: 12px 24px;
-          border: none;
-          border-radius: 6px;
-          font-size: 14px;
-          font-weight: 600;
-          cursor: pointer;
-          transition: transform 0.2s;
-        }
-        button:hover {
-          transform: scale(1.05);
-        }
-        .btn-decrypt {
-          background: #ec4899;
-          color: white;
-        }
-        .btn-close {
-          background: rgba(255,255,255,0.2);
-          color: white;
+          background: rgba(0,0,0,0.3);
+          box-shadow: 0 0 0 3px rgba(255,255,255,0.1);
         }
         .info {
           font-size: 12px;
           opacity: 0.8;
           margin-top: 10px;
+          padding-left: 4px;
+        }
+        .buttons {
+          display: flex;
+          flex-direction: column;
+          gap: 10px;
+          margin-top: 16px;
+          flex-shrink: 0;
+        }
+        button {
+          padding: 14px 24px;
+          border: none;
+          border-radius: 10px;
+          font-size: 15px;
+          font-weight: 600;
+          cursor: pointer;
+          transition: all 0.2s ease;
+          box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+          position: relative;
+          overflow: hidden;
+        }
+        button::before {
+          content: '';
+          position: absolute;
+          top: 50%;
+          left: 50%;
+          width: 0;
+          height: 0;
+          border-radius: 50%;
+          background: rgba(255,255,255,0.3);
+          transform: translate(-50%, -50%);
+          transition: width 0.6s, height 0.6s;
+        }
+        button:hover::before {
+          width: 300px;
+          height: 300px;
+        }
+        button:hover {
+          transform: translateY(-2px);
+          box-shadow: 0 6px 20px rgba(0,0,0,0.25);
+        }
+        button:active {
+          transform: translateY(0);
+          box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+        }
+        .btn-decrypt {
+          background: linear-gradient(135deg, #ec4899 0%, #db2777 100%);
+          color: white;
+        }
+        .btn-decrypt:hover {
+          background: linear-gradient(135deg, #f05aa8 0%, #e43888 100%);
+        }
+        .btn-close {
+          background: rgba(255,255,255,0.15);
+          color: white;
+          border: 1px solid rgba(255,255,255,0.2);
+        }
+        .btn-close:hover {
+          background: rgba(255,255,255,0.25);
+        }
+        .button-text {
+          position: relative;
+          z-index: 1;
         }
       </style>
     </head>
     <body>
       <div class="container">
-        <h2>🔓 Decrypt Secret</h2>
-        <p>Paste an encrypted secret to decrypt and copy</p>
+        <div class="icon">🔓</div>
+        <h2>Decrypt Secret</h2>
+        <p class="subtitle">Paste an encrypted secret to decrypt and copy</p>
         <div class="decrypt-section">
           <input type="text" id="decryptInput" class="decrypt-input" placeholder="Paste SG_ENCRYPTED:... here">
           <div class="info">Encrypted secrets start with "SG_ENCRYPTED:"</div>
         </div>
         <div class="buttons">
-          <button class="btn-decrypt" onclick="window.decrypt()">Decrypt & Copy</button>
-          <button class="btn-close" onclick="window.close()">Close</button>
+          <button class="btn-decrypt" onclick="window.decrypt()">
+            <span class="button-text">🔓 Decrypt & Copy</span>
+          </button>
+          <button class="btn-close" onclick="window.close()">
+            <span class="button-text">Close</span>
+          </button>
         </div>
       </div>
       <script>
@@ -539,23 +602,29 @@ export function showDecryptDialog(): void {
           ipcRenderer.send('close-decrypt-dialog');
         };
         
-        // Enable paste in input field - allow default paste behavior
+        // Enable paste in input field
         input.addEventListener('paste', (e) => {
-          // Allow default paste - don't prevent it
           console.log('Paste event in decrypt dialog - allowing');
         });
         
-        // Also handle keyboard shortcuts - allow Cmd+V / Ctrl+V
         input.addEventListener('keydown', (e) => {
           if ((e.metaKey || e.ctrlKey) && e.key === 'v') {
-            // Allow default paste behavior
             console.log('Paste shortcut in decrypt dialog - allowing');
-            // Don't prevent default - let browser handle paste
           }
         });
         
-        // Auto-focus input
         input.focus();
+        
+        // Auto-resize window to fit content
+        window.addEventListener('DOMContentLoaded', () => {
+          setTimeout(() => {
+            const container = document.querySelector('.container');
+            if (container) {
+              const height = container.scrollHeight + 5; // Minimal padding
+              ipcRenderer.send('resize-dialog', 'decrypt', Math.max(400, Math.min(height, 650))); // Min 400px, max 650px
+            }
+          }, 100);
+        });
       </script>
     </body>
     </html>
@@ -583,9 +652,18 @@ export function showDecryptDialog(): void {
  */
 export function closeBlockingDialog(): void {
   if (blockedWindow) {
+    // Ensure clipboard is cleared when closing (unless user allowed for 60s)
+    if (!userAllowedPasteFlag) {
+      try {
+        clipboard.clear();
+        console.log("✅ Clipboard cleared immediately before closing dialog");
+      } catch (error) {
+        console.error("Error clearing clipboard:", error);
+      }
+    }
+    
     blockedWindow.close();
-    blockedWindow = null;
-    console.log("Blocking dialog closed by user");
+    console.log("Blocking dialog closing");
   }
 }
 
@@ -597,11 +675,62 @@ export function closeDecryptDialog(): void {
 }
 
 /**
- * Allow paste temporarily
+ * Allow paste temporarily - keeps secret in clipboard for specified seconds, then auto-clears
  */
 export function allowPasteTemporarily(seconds = 60): void {
   allowPasteUntil = Date.now() + seconds * 1000;
-  currentSecret = null;
+  userAllowedPasteFlag = true; // Set flag so clipboard won't be cleared on dialog close
+  
+  // Clear any existing timer
+  if (autoClearTimer) {
+    clearTimeout(autoClearTimer);
+  }
+  
+  // Set timer to auto-clear clipboard after the specified time
+  autoClearTimer = setTimeout(() => {
+    try {
+      clipboard.clear();
+      console.log(`✅ Clipboard auto-cleared after ${seconds} seconds - secret removed from everywhere`);
+      
+      // Clear multiple times to ensure it's completely cleared
+      setTimeout(() => {
+        try {
+          clipboard.clear();
+          console.log("✅ Clipboard cleared again (double-check)");
+        } catch (e) {
+          // Ignore
+        }
+      }, 50);
+      
+      setTimeout(() => {
+        try {
+          clipboard.clear();
+          console.log("✅ Clipboard cleared final time (triple-check)");
+        } catch (e) {
+          // Ignore
+        }
+      }, 200);
+      
+      // Reset flags
+      userAllowedPasteFlag = false;
+      allowPasteUntil = 0;
+      currentSecret = null;
+      
+      // Show notification
+      if (Notification.isSupported()) {
+        new Notification({
+          title: "🔒 Secret Auto-Cleared",
+          body: "The secret has been automatically cleared from clipboard after 60 seconds"
+        }).show();
+      }
+    } catch (error) {
+      console.error("❌ Error auto-clearing clipboard:", error);
+    }
+    
+    autoClearTimer = null;
+  }, seconds * 1000);
+  
+  console.log(`⏰ Auto-clear timer set for ${seconds} seconds`);
 }
 
 /**
@@ -648,333 +777,32 @@ export function registerRedactedPasteHotkey(): void {
 }
 
 /**
- * Intercept Cmd+V to block dangerous pastes
- * Note: Electron's globalShortcut can't prevent paste, but we can detect it
- * and show a warning dialog, then offer recovery options
- */
-export async function interceptPaste(): Promise<void> {
-  const config = getConfig();
-  
-  if (!config.safePasteMode) {
-    return; // Don't intercept
-  }
-
-  // Check if paste is temporarily allowed
-  if (Date.now() < allowPasteUntil) {
-    return; // Allow paste
-  }
-
-  let clipboardText: string;
-  try {
-    clipboardText = clipboard.readText().trim();
-  } catch (clipboardError) {
-    return; // Clipboard empty, allow paste
-  }
-  
-  if (!clipboardText || clipboardText.length < 8) {
-    return; // Not a secret, allow paste
-  }
-
-  // Check ignore patterns
-  for (const pattern of config.ignorePatterns) {
-    if (matchesIgnorePattern(clipboardText, pattern)) {
-      return; // Ignored pattern, allow paste
-    }
-  }
-
-  // Detect if it's a secret
-  const detection = detectSecrets(clipboardText);
-  if (!detection.detected) {
-    return; // Not a secret, allow paste
-  }
-
-  // Get active app
-  const appName = await getActiveAppName();
-  
-  // Check app rules
-  const allowed = isAppAllowed(appName, config);
-
-  if (allowed) {
-    return; // App is allowed, let paste through
-  }
-
-  // BLOCK THE PASTE!
-  currentSecret = clipboardText;
-  
-  console.log(`🚫 Blocking paste: ${detection.type} in ${appName}`);
-
-  // Show blocking dialog immediately
-  showPasteBlockDialog(
-    clipboardText,
-    detection.type,
-    appName,
-    () => {
-      // Reveal once - allow this paste
-      allowPasteTemporarily(5);
-      // Put original back in clipboard for next paste
-      setTimeout(() => {
-        clipboard.writeText(clipboardText);
-      }, 100);
-    },
-    () => {
-      // Redact and paste
-      const redacted = redactSecret(clipboardText);
-      clipboard.writeText(redacted);
-      // Show notification that redacted version is ready
-      if (Notification.isSupported()) {
-        new Notification({
-          title: "Redacted Version Ready",
-          body: "Redacted secret is in clipboard. Paste again (Cmd+V) to use it."
-        }).show();
-      }
-    },
-    () => {
-      // Allow for 60s
-      allowPasteTemporarily(60);
-      // Put original back in clipboard
-      setTimeout(() => {
-        clipboard.writeText(clipboardText);
-      }, 100);
-    }
-  );
-}
-
-/**
- * Register paste blocking for Cmd+V/Ctrl+V in blocked apps
- * This intercepts the shortcut and clears clipboard if secret detected
+ * Register paste blocking - REMOVED
+ * Paste blocking is no longer needed - popup shows on copy when Safe Copy Mode is ON, clipboard auto-clears after 60s if allowed
  */
 export function registerPasteBlocking(): void {
-  if (pasteInterceptRegistered) {
-    console.log("Paste blocking already registered");
-    return;
-  }
-  
-  const config = getConfig();
-  if (!config.safePasteMode) {
-    console.log("Safe paste mode disabled - not registering paste blocking");
-    return;
-  }
-
-  // Register Cmd+V for macOS - SIMPLE & FAST
-  if (process.platform === "darwin") {
-    const cmdSuccess = globalShortcut.register("Command+V", () => {
-      console.log("🔍 Cmd+V detected!");
-      
-      // Allow paste in dialogs
-      const focusedWindow = BrowserWindow.getFocusedWindow();
-      if (focusedWindow && (focusedWindow === decryptWindow || blockedWindow)) {
-        console.log("   Allowing paste in dialog");
-        focusedWindow.webContents.paste();
-        return;
-      }
-      
-      // Prevent duplicate blocking
-      const now = Date.now();
-      if (isBlockingPaste && now - lastBlockedPasteTime < BLOCK_COOLDOWN) {
-        console.log("   Already blocking - skipping");
-        return;
-      }
-      
-      // SIMPLE CHECK: Is it a secret? Block it immediately
-      console.log("   Checking clipboard for secrets...");
-      const result = shouldBlockPasteSync();
-      console.log("   Check result:", result.shouldBlock ? "BLOCK" : "ALLOW", result.detection?.type || "none");
-      
-      if (result.shouldBlock && result.clipboardText && result.detection) {
-        console.log(`🚫 Blocking paste: ${result.detection.type}`);
-        
-        // Clear clipboard IMMEDIATELY
-        clipboard.clear();
-        currentSecret = result.clipboardText;
-        
-        // Show dialog IMMEDIATELY - don't set isBlockingPaste here, let the dialog function set it
-        const clipboardText = result.clipboardText;
-        console.log("   Showing blocking dialog...");
-        showPasteBlockDialog(
-          clipboardText,
-          result.detection.type,
-          "Unknown",
-          () => {
-            allowPasteTemporarily(60);
-            isBlockingPaste = false;
-            setTimeout(() => clipboard.writeText(clipboardText), 100);
-          },
-          () => {
-            clipboard.writeText(encryptForSharing(clipboardText));
-            isBlockingPaste = false;
-          }
-        );
-        console.log("   Dialog should be visible now");
-      } else {
-        console.log("   Not blocking - allowing paste");
-      }
-    });
-    if (cmdSuccess) {
-      console.log("✅ Paste blocking registered (Cmd+V)");
-      pasteInterceptRegistered = true;
-    } else {
-      console.warn("⚠️ Failed to register Cmd+V blocking - may need Accessibility permissions");
-    }
-  }
-  
-  // Register Ctrl+V for all platforms - SIMPLE & FAST
-  const ctrlSuccess = globalShortcut.register("Control+V", () => {
-    console.log("🔍 Ctrl+V detected!");
-    
-    // Allow paste in dialogs
-    const focusedWindow = BrowserWindow.getFocusedWindow();
-    if (focusedWindow && (focusedWindow === decryptWindow || blockedWindow)) {
-      console.log("   Allowing paste in dialog");
-      focusedWindow.webContents.paste();
-      return;
-    }
-    
-    // Prevent duplicate blocking
-    const now = Date.now();
-    if (isBlockingPaste && now - lastBlockedPasteTime < BLOCK_COOLDOWN) {
-      console.log("   Already blocking - skipping");
-      return;
-    }
-    
-    // SIMPLE CHECK: Is it a secret? Block it immediately
-    console.log("   Checking clipboard for secrets...");
-    const result = shouldBlockPasteSync();
-    console.log("   Check result:", result.shouldBlock ? "BLOCK" : "ALLOW", result.detection?.type || "none");
-    
-    if (result.shouldBlock && result.clipboardText && result.detection) {
-      console.log(`🚫 Blocking paste: ${result.detection.type}`);
-      
-      // Clear clipboard IMMEDIATELY
-      clipboard.clear();
-      currentSecret = result.clipboardText;
-      
-      // Show dialog IMMEDIATELY - don't set isBlockingPaste here, let the dialog function set it
-      console.log("   Showing blocking dialog...");
-      showPasteBlockDialog(
-        result.clipboardText,
-        result.detection.type,
-        "Unknown",
-        () => {
-          allowPasteTemporarily(60);
-          isBlockingPaste = false;
-          if (result.clipboardText) {
-            setTimeout(() => clipboard.writeText(result.clipboardText), 100);
-          }
-        },
-        () => {
-          if (result.clipboardText) {
-            clipboard.writeText(encryptForSharing(result.clipboardText));
-          }
-          isBlockingPaste = false;
-        }
-      );
-      console.log("   Dialog should be visible now");
-    } else {
-      console.log("   Not blocking - allowing paste");
-    }
-  });
-  if (ctrlSuccess) {
-    console.log("✅ Paste blocking registered (Ctrl+V)");
-    if (!pasteInterceptRegistered) {
-      pasteInterceptRegistered = true;
-    }
-  } else {
-    console.warn("⚠️ Failed to register Ctrl+V blocking - may need Accessibility permissions");
-    // Try alternative registration
-    try {
-      const altSuccess = globalShortcut.register("Ctrl+V", async () => {
-        // Check if a dialog is focused - if so, trigger paste programmatically
-        const focusedWindow = BrowserWindow.getFocusedWindow();
-        if (focusedWindow && (focusedWindow === decryptWindow || focusedWindow === blockedWindow)) {
-          console.log("🔍 Ctrl+V (alt) in dialog - triggering paste programmatically");
-          // Trigger paste in the focused dialog
-          focusedWindow.webContents.paste();
-          return; // Don't block - paste already triggered
-        }
-        console.log("🔍 Ctrl+V (alt) detected - checking if paste should be blocked");
-        await blockPasteIfNeeded();
-      });
-      if (altSuccess) {
-        console.log("✅ Paste blocking registered (Ctrl+V - alternative)");
-        pasteInterceptRegistered = true;
-      }
-    } catch (error) {
-      console.error("❌ Failed to register Ctrl+V with alternative method:", error);
-    }
-  }
-  
-  // Also try Meta+V (Windows key + V on Windows/Linux)
-  if (process.platform !== "darwin") {
-    try {
-      const metaSuccess = globalShortcut.register("Meta+V", async () => {
-        console.log("🔍 Meta+V detected - checking if paste should be blocked");
-        await blockPasteIfNeeded();
-      });
-      if (metaSuccess) {
-        console.log("✅ Paste blocking registered (Meta+V)");
-      }
-    } catch (error) {
-      // Meta+V might not be available on all systems
-      console.log("ℹ️ Meta+V not available (this is normal)");
-    }
-  }
+  console.log("ℹ️ Paste blocking disabled - popup shows on copy (Safe Copy Mode), clipboard auto-clears after 60s if allowed");
 }
 
 /**
- * Block paste if secret detected in blocked app
- * This is called from the globalShortcut handler
- */
-// This function is no longer needed - blocking is handled directly in globalShortcut handlers
-// Keeping for compatibility but it's not used
-async function blockPasteIfNeeded(): Promise<void> {
-  // Not used - blocking handled in globalShortcut handlers
-}
-
-/**
- * Register paste interception (legacy - kept for compatibility)
- * Note: This detects Cmd+V presses but can't prevent the actual paste
- * We show a blocking dialog and offer recovery options
+ * Register paste interception - REMOVED
  */
 export function registerPasteInterception(): void {
-  if (pasteInterceptRegistered) {
-    console.log("Paste interception already registered");
-    return;
-  }
-  
-  // On macOS, we intercept Cmd+V
-  if (process.platform === "darwin") {
-    // Register Cmd+V interception
-    const success = globalShortcut.register("Command+V", async () => {
-      console.log("🔔 Cmd+V detected!");
-      await interceptPaste();
-    });
-
-    if (success) {
-      console.log("✅ Paste interception registered (Cmd+V)");
-      pasteInterceptRegistered = true;
-    } else {
-      console.error("❌ Failed to register paste interception - may need Accessibility permissions");
-      console.warn("⚠️ Please grant Accessibility permissions in System Settings");
-    }
-  }
-  
-  // Also register for Ctrl+V (Windows/Linux)
-  const ctrlSuccess = globalShortcut.register("Control+V", async () => {
-    await interceptPaste();
-  });
-  
-  if (!ctrlSuccess) {
-    console.warn("⚠️ Failed to register Ctrl+V interception");
-  }
+  console.log("ℹ️ Paste interception disabled - popup shows on copy");
 }
 
 /**
- * Unregister paste interception
+ * Unregister paste interception - REMOVED
  */
 export function unregisterPasteInterception(): void {
-  globalShortcut.unregister("Command+V");
-  globalShortcut.unregister("Control+V");
-  pasteInterceptRegistered = false;
+  // No longer intercepting paste
+}
+
+/**
+ * Intercept paste - REMOVED
+ */
+export async function interceptPaste(): Promise<void> {
+  return;
 }
 
 /**
@@ -991,3 +819,16 @@ export function cleanupBlockingDialog(): void {
   }
 }
 
+/**
+ * Get blocking window instance (for resizing)
+ */
+export function getBlockingWindow(): BrowserWindow | null {
+  return blockedWindow;
+}
+
+/**
+ * Get decrypt window instance (for resizing)
+ */
+export function getDecryptWindow(): BrowserWindow | null {
+  return decryptWindow;
+}

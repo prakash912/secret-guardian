@@ -1,11 +1,11 @@
-import { app, Tray, Menu, clipboard, Notification, ipcMain, globalShortcut } from "electron";
+import { app, Tray, Menu, clipboard, Notification, ipcMain, globalShortcut, nativeImage } from "electron";
 import path from "path";
 import fs from "fs";
 import { detectSecrets } from "./detectSecrets";
-import { getConfig, updateConfig, AVAILABLE_APPS, AVAILABLE_PATTERNS } from "./config";
-import { addToHistory, getHistory, clearHistory, getPreviousSafeItem } from "./clipboardHistory";
-import { showPasteBlockDialog, allowPasteTemporarily, clearCurrentSecret, registerRedactedPasteHotkey, unregisterPasteInterception, cleanupBlockingDialog, registerPasteBlocking, showDecryptDialog, closeDecryptDialog, closeBlockingDialog, getIsBlockingPaste, getLastBlockedPasteTime, setCurrentSecret } from "./pasteBlocker";
-import { redactSecret, encryptForSharing, decryptShared, isEncryptedShared, getActiveAppName } from "./utils";
+import { getConfig, updateConfig, AVAILABLE_APPS } from "./config";
+import { addToHistory, getHistory, clearHistory } from "./clipboardHistory";
+import { showPasteBlockDialog, allowPasteTemporarily, clearCurrentSecret, registerRedactedPasteHotkey, unregisterPasteInterception, cleanupBlockingDialog, showDecryptDialog, closeDecryptDialog, closeBlockingDialog, isPasteAllowed, setUserAllowedPasteFlag, getBlockingWindow, getDecryptWindow } from "./pasteBlocker";
+import { encryptForSharing, decryptShared, isEncryptedShared, getActiveAppName, isAppAllowed } from "./utils";
 
 app.setAppUserModelId("com.secretguardian.app");
 app.setName("Secret Guardian");
@@ -17,7 +17,7 @@ let autoClearTimer: NodeJS.Timeout | null = null;
 let clipboardMonitorStarted = false;
 // COPY_DETECTION_DELAY removed - using clipboardChanged check instead
 
-// Monitor clipboard for paste blocking
+// Monitor clipboard for secret detection (only when Safe Copy Mode is ON)
 let pasteMonitorInterval: NodeJS.Timeout | null = null;
 
 function updateTrayMenu() {
@@ -30,12 +30,24 @@ function updateTrayMenu() {
       { label: "🛡️ Secret Guardian", enabled: false },
       { type: "separator" },
       {
-        label: config.safePasteMode ? "✓ Safe Paste Mode: ON" : "Safe Paste Mode: OFF",
-      click: () => {
-        updateConfig({ safePasteMode: !config.safePasteMode });
-        updateTrayMenu();
-      }
-    },
+        label: config.safeCopyMode ? "✓ Safe Copy Mode: ON" : "Safe Copy Mode: OFF",
+        click: () => {
+          const newMode = !config.safeCopyMode;
+          updateConfig({ safeCopyMode: newMode });
+          updateTrayMenu();
+          
+          // Stop monitoring if mode is turned OFF
+          if (!newMode && pasteMonitorInterval) {
+            clearInterval(pasteMonitorInterval);
+            pasteMonitorInterval = null;
+            console.log("🛑 Safe Copy Mode OFF - Clipboard monitoring stopped");
+          } else if (newMode && !pasteMonitorInterval) {
+            // Restart monitoring if mode is turned ON
+            startPasteMonitoring();
+            console.log("✅ Safe Copy Mode ON - Clipboard monitoring started");
+          }
+        }
+      },
     { type: "separator" },
     {
       label: "Recovery Actions",
@@ -47,23 +59,6 @@ function updateTrayMenu() {
             clearCurrentSecret();
             currentSecret = null;
             updateTrayMenu();
-          }
-        },
-        {
-          label: "Copy Redacted Version",
-          click: () => {
-            if (currentSecret) {
-              clipboard.writeText(redactSecret(currentSecret));
-            }
-          }
-        },
-        {
-          label: "Copy Previous Safe Item",
-          click: () => {
-            const safeItem = getPreviousSafeItem();
-            if (safeItem) {
-              clipboard.writeText(safeItem.content);
-            }
           }
         },
         { type: "separator" },
@@ -112,6 +107,14 @@ function updateTrayMenu() {
             updateConfig({ allowedApps: updated });
             updateTrayMenu();
             console.log(`Removed "${app}" from allowed apps`);
+            
+            // Show notification
+            if (Notification.isSupported()) {
+              new Notification({
+                title: "✅ App Removed from Allowed",
+                body: `"${app}" is no longer allowed. It will appear in Available Apps below.`
+              }).show();
+            }
           }
         })),
         ...(config.allowedApps.length > 0 ? [{ type: "separator" }] : []),
@@ -128,6 +131,14 @@ function updateTrayMenu() {
               updateConfig({ allowedApps: updatedAllowed, blockedApps: updatedBlocked });
               updateTrayMenu();
               console.log(`Added "${app}" to allowed apps`);
+              
+              // Show notification
+              if (Notification.isSupported()) {
+                new Notification({
+                  title: "✅ App Added to Allowed",
+                  body: `"${app}" is now allowed. Secrets copied in this app won't trigger warnings.`
+                }).show();
+              }
             }
           })),
         { type: "separator" },
@@ -145,6 +156,14 @@ function updateTrayMenu() {
             updateConfig({ blockedApps: updated });
             updateTrayMenu();
             console.log(`Removed "${app}" from blocked apps`);
+            
+            // Show notification
+            if (Notification.isSupported()) {
+              new Notification({
+                title: "✅ App Removed from Blocked",
+                body: `"${app}" is no longer blocked. It will appear in Available Apps below.`
+              }).show();
+            }
           }
         })),
         ...(config.blockedApps.length > 0 ? [{ type: "separator" }] : []),
@@ -161,41 +180,18 @@ function updateTrayMenu() {
               updateConfig({ allowedApps: updatedAllowed, blockedApps: updatedBlocked });
               updateTrayMenu();
               console.log(`Added "${app}" to blocked apps`);
+              
+              // Show notification
+              if (Notification.isSupported()) {
+                new Notification({
+                  title: "🚫 App Added to Blocked",
+                  body: `"${app}" is now blocked. Secrets copied in this app will trigger warnings.`
+                }).show();
+              }
             }
           })),
         { type: "separator" },
         { label: `Selected: ${config.blockedApps.length}`, enabled: false }
-      ]
-    },
-    {
-      label: "Ignore Patterns",
-      submenu: [
-        // Show currently selected patterns (click to remove)
-        ...config.ignorePatterns.map((pattern) => ({
-          label: `⊘ ${pattern}`,
-          click: () => {
-            const updated = config.ignorePatterns.filter((p) => p !== pattern);
-            updateConfig({ ignorePatterns: updated });
-            updateTrayMenu();
-            console.log(`Removed pattern "${pattern}"`);
-          }
-        })),
-        ...(config.ignorePatterns.length > 0 ? [{ type: "separator" }] : []),
-        // Show ALL available patterns at bottom (including removed ones) - click to add
-        { label: "─ Available Patterns ─", enabled: false },
-        ...AVAILABLE_PATTERNS
-          .filter((pattern) => !config.ignorePatterns.includes(pattern))
-          .map((pattern) => ({
-            label: `○ ${pattern}`,
-            click: () => {
-              const updated = [...config.ignorePatterns, pattern];
-              updateConfig({ ignorePatterns: updated });
-              updateTrayMenu();
-              console.log(`Added pattern "${pattern}"`);
-            }
-          })),
-        { type: "separator" },
-        { label: `Selected: ${config.ignorePatterns.length}`, enabled: false }
       ]
     },
     { type: "separator" },
@@ -207,35 +203,6 @@ function updateTrayMenu() {
       }
     },
     { type: "separator" },
-    {
-      label: "Test Notification",
-      click: () => {
-        if (Notification.isSupported()) {
-          new Notification({
-            title: "🧪 Test Notification",
-            body: "If you see this, notifications are working!"
-          }).show();
-        }
-      }
-    },
-    {
-      label: "Test Blocking Dialog",
-      click: async () => {
-        const testSecret = "AKIAIOSFODNN7EXAMPLE";
-        const appName = "Unknown"; // Static blocking - app name not needed
-        console.log("🧪 Testing blocking dialog...");
-        currentSecret = testSecret;
-        showPasteBlockDialog(
-          testSecret,
-          "AWS Access Key ID (Test)",
-          appName,
-          () => console.log("Test: Reveal"),
-          () => console.log("Test: Redact"),
-          () => console.log("Test: Allow")
-        );
-      }
-    },
-      { type: "separator" },
       { label: "Quit", click: () => app.quit() }
     ];
     
@@ -262,12 +229,17 @@ function updateTrayMenu() {
   }
 }
 
-// Removed showRecoveryNotification - no warnings on copy, only on paste
-
-// Clipboard monitoring - only tracks secrets for history, NO dialogs on copy
-// Dialogs only appear when user actually pastes (Control+V/Cmd+V) in blocked apps
+// Clipboard monitoring - detects secrets on copy and shows popup dialog
+// Only active when Safe Copy Mode is ON
 function startPasteMonitoring() {
   if (pasteMonitorInterval) return;
+
+  // Check Safe Copy Mode before starting
+  const config = getConfig();
+  if (!config.safeCopyMode) {
+    console.log("ℹ️ Safe Copy Mode is OFF - Not starting clipboard monitoring");
+    return;
+  }
 
   // Starting clipboard monitoring
   
@@ -301,10 +273,16 @@ function startPasteMonitoring() {
   
   let pasteMonitorStarted = false;
   
-  // Delay paste monitoring to avoid false positives
+  // Delay clipboard monitoring to avoid false positives
   setTimeout(() => {
+    const config = getConfig();
+    if (!config.safeCopyMode) {
+      // Safe Copy Mode is OFF - don't start monitoring
+      console.log("ℹ️ Safe Copy Mode is OFF - Clipboard monitoring not started");
+      return;
+    }
     pasteMonitorStarted = true;
-    console.log("✅ Clipboard monitoring active (mouse paste blocking enabled)");
+    console.log("✅ Clipboard monitoring active (Safe Copy Mode: ON)");
   }, 2000);
   
   // Track when secret was copied to clipboard
@@ -312,6 +290,13 @@ function startPasteMonitoring() {
   let secretContent = "";
   
   pasteMonitorInterval = setInterval(async () => {
+    // Check Safe Copy Mode first - if OFF, stop all monitoring
+    const config = getConfig();
+    if (!config.safeCopyMode) {
+      // Mode is OFF - stop monitoring completely
+      return;
+    }
+    
     // Don't monitor until startup delay has passed
     if (!pasteMonitorStarted) {
       return;
@@ -325,131 +310,106 @@ function startPasteMonitoring() {
         // Clipboard might be empty or inaccessible
         return;
       }
-      
-      const config = getConfig();
-      if (!config.safePasteMode) {
-        lastClipboardText = text;
-        return;
-      }
 
       // Only trigger if clipboard actually changed (not just checking the same content)
       const clipboardChanged = text !== lastClipboardText && text.length > 0;
       
-      // CRITICAL: COPY DETECTION - Check FIRST before ANY other processing
-      // If clipboard changed, it's ALWAYS a COPY - return immediately, NO dialogs, NO blocking
+      // COPY DETECTION - Show popup when secret is copied (works for both mouse and keyboard copy)
+      // This detects ANY clipboard change, whether from mouse right-click copy or keyboard Cmd+C
       if (clipboardChanged) {
+        console.log("📋 Clipboard changed detected (copy operation - mouse or keyboard)");
+        
         // Update tracking immediately
         lastClipboardText = text;
         clipboardHasSecret = false;
         secretCopiedTime = 0;
         secretContent = "";
         
-        // This is a COPY operation - just track in history silently, NO dialog, NO blocking
+        // This is a COPY operation - check if it's a secret and show popup
         if (text && text.length >= 8) {
-          // Check if it's a secret for history tracking only
-          if (!isEncryptedShared(text)) {
-            const detection = detectSecrets(text);
-            if (detection.detected) {
-              clipboardHasSecret = true;
-              secretCopiedTime = Date.now();
-              secretContent = text;
-              // Track in history silently - NO dialog, NO blocking
-              addToHistory(text, true, detection.type, "Unknown");
+          // Get app name first to check if it's allowed/blocked
+          let appName = "Unknown";
+          try {
+            appName = await getActiveAppName();
+            console.log(`📱 Detected app name: "${appName}"`);
+          } catch (error) {
+            console.log("   Could not get app name, using 'Unknown'");
+          }
+          
+          // Check if it's encrypted (never block encrypted)
+          if (isEncryptedShared(text)) {
+            addToHistory(text, true, "Encrypted Secret", appName);
+            return; // Don't show popup for encrypted
+          }
+          
+          // Check if it's a secret
+          const detection = detectSecrets(text);
+          if (detection.detected) {
+            // Check if paste is temporarily allowed (don't show popup if allowed)
+            if (isPasteAllowed()) {
+              console.log("ℹ️ Paste is temporarily allowed - skipping popup");
+              addToHistory(text, true, detection.type, appName);
               updateTrayMenu();
-            } else {
-              addToHistory(text, false, undefined, "Unknown");
+              return; // Don't show popup if paste is allowed
             }
+            
+            // Check if app is allowed - if so, don't show popup
+            const config = getConfig();
+            const isAllowed = isAppAllowed(appName, config);
+            console.log(`🔍 App check: "${appName}" - Allowed: ${isAllowed}, Allowed apps: [${config.allowedApps.join(", ")}], Blocked apps: [${config.blockedApps.join(", ")}]`);
+            
+            if (isAllowed) {
+              console.log(`✅ App "${appName}" is allowed - skipping popup`);
+              addToHistory(text, true, detection.type, appName);
+              updateTrayMenu();
+              return; // Don't show popup for allowed apps
+            }
+            
+            clipboardHasSecret = true;
+            secretCopiedTime = Date.now();
+            secretContent = text;
+            
+            // SECRET DETECTED ON COPY - Show popup immediately (works for mouse and keyboard copy)
+            console.log(`🚨 Secret detected on COPY (mouse/keyboard): ${detection.type} in app: ${appName}`);
+            
+            // Track in history
+            addToHistory(text, true, detection.type, appName);
+            updateTrayMenu();
+            
+            // Show blocking dialog on COPY - works for both mouse and keyboard copy
+            currentSecret = text;
+            console.log(`   Showing popup dialog for app: ${appName}`);
+            showPasteBlockDialog(
+              text,
+              detection.type,
+              appName,
+              () => {
+                // Allow option - allow paste for 60s
+                // Note: Dialog will be closed by the IPC handler
+                allowPasteTemporarily(60);
+              },
+              () => {
+                // Encrypt option - replace clipboard with encrypted version
+                // Note: Dialog will be closed by the IPC handler
+                clipboard.writeText(encryptForSharing(text));
+              }
+            );
+            console.log("   Popup should be visible now");
           } else {
-            // Encrypted - track silently
-            addToHistory(text, true, "Encrypted Secret", "Unknown");
+            // Not a secret - just track in history
+            addToHistory(text, false, undefined, appName);
           }
+          
+          // Update last app name
+          lastAppName = appName;
         }
         
-        // Update last app name when clipboard changes (copy happened in this app)
-        getActiveAppName()
-          .then((appName) => {
-            lastAppName = appName;
-          })
-          .catch(() => {
-            lastAppName = "Unknown";
-          });
-        
-        return; // Exit immediately - NEVER show dialog on COPY
+        return; // Exit after processing copy
       }
       
-      // MOUSE PASTE DETECTION: Immediate blocking for secrets
-      // Strategy: After a very short delay (50ms) from copy, if clipboard still has secret,
-      // aggressively monitor and block any paste attempt by clearing clipboard immediately
-      if (!text || text.length < 8) {
-        return;
-      }
-
-      // CRITICAL: Check encrypted keys FIRST - they should NEVER be blocked
-      if (isEncryptedShared(text)) {
-        addToHistory(text, true, "Encrypted Secret", "Unknown");
-        return; // Exit early - never block encrypted keys
-      }
-
-      // Check if clipboard still has the same secret content
-      if (text !== lastClipboardText || text !== secretContent) {
-        return; // Content changed, not a paste
-      }
-
-      // Check if we have a secret in clipboard
-      if (!clipboardHasSecret || !secretContent || secretCopiedTime === 0) {
-        // Re-check if it's a secret (in case clipboard was set before monitoring started)
-        const detection = detectSecrets(text);
-        if (!detection.detected) {
-          return; // Not a secret
-        }
-        clipboardHasSecret = true;
-        secretContent = text;
-        secretCopiedTime = Date.now();
-      }
-
-      // IMMEDIATE MOUSE PASTE BLOCKING:
-      // After 50ms from copy, if clipboard still has secret, clear it immediately
-      // This prevents paste from working - when user tries to paste, clipboard will be empty
-      const timeSinceCopy = Date.now() - secretCopiedTime;
-      const PASTE_PROTECTION_DELAY = 50; // Very short delay - 50ms after copy
-
-      if (timeSinceCopy > PASTE_PROTECTION_DELAY && text === secretContent) {
-        // Prevent duplicate blocking
-        const now = Date.now();
-        const isBlocking = getIsBlockingPaste();
-        const lastBlocked = getLastBlockedPasteTime();
-        if (isBlocking && now - lastBlocked < 1000) {
-          return; // Already blocking
-        }
-
-        console.log(`🖱️ Mouse paste blocked immediately: ${detectSecrets(text).type}`);
-        
-        // Clear clipboard IMMEDIATELY to prevent paste
-        clipboard.clear();
-        setCurrentSecret(text);
-        
-        // Show blocking dialog IMMEDIATELY
-        const detection = detectSecrets(text);
-        showPasteBlockDialog(
-          text,
-          detection.type,
-          "Unknown",
-          () => {
-            allowPasteTemporarily(60);
-            setTimeout(() => clipboard.writeText(text), 100);
-          },
-          () => {
-            clipboard.writeText(encryptForSharing(text));
-          }
-        );
-        
-        // Reset to prevent re-detection
-        lastClipboardText = "";
-        clipboardHasSecret = false;
-        secretContent = "";
-        secretCopiedTime = 0;
-      }
-      
+      // No further processing needed - popup already shown on copy
+      // Popup shown on copy (Safe Copy Mode) - user can choose to allow for 60s or encrypt/close
+      // Clipboard auto-clears after 60s if allowed
       return;
       
     } catch (error) {
@@ -485,28 +445,46 @@ app.whenReady().then(() => {
     console.error("Failed to show initial notification:", error);
   }
 
-  // Create tray icon
-  const iconPath = path.join(app.getAppPath(), "src/assets/menu.png");
-  console.log(`📌 Loading tray icon from: ${iconPath}`);
+  // Create tray icon - try multiple paths
+  const possiblePaths = [
+    path.join(__dirname, "../src/assets/menu.png"), // Development
+    path.join(__dirname, "../assets/menu.png"), // Production (packaged)
+    path.join(app.getAppPath(), "src/assets/menu.png"), // Alternative dev path
+    path.join(app.getAppPath(), "assets/menu.png"), // Alternative prod path
+    path.join(process.resourcesPath || app.getAppPath(), "assets/menu.png"), // Packaged app
+  ];
+  
+  let iconPath: string | null = null;
+  console.log(`📌 Looking for tray icon...`);
+  
+  for (const testPath of possiblePaths) {
+    console.log(`   Checking: ${testPath}`);
+    if (fs.existsSync(testPath)) {
+      iconPath = testPath;
+      console.log(`✅ Found icon at: ${iconPath}`);
+      break;
+    }
+  }
   
   try {
-    // Check if icon file exists
-    if (!fs.existsSync(iconPath)) {
-      console.error(`❌ Icon file not found at: ${iconPath}`);
-      console.log("   Trying alternative path...");
-      // Try alternative path
-      const altPath = path.join(__dirname, "../assets/menu.png");
-      if (fs.existsSync(altPath)) {
-        tray = new Tray(altPath);
-        console.log(`✅ Using alternative icon path: ${altPath}`);
-      } else {
-        console.error("❌ Icon not found in alternative path either");
-        // Create a simple text-based tray as fallback
-        tray = new Tray(iconPath); // Will use default or fail gracefully
-      }
+    if (!iconPath) {
+      console.error("❌ Icon file not found in any of the expected locations:");
+      possiblePaths.forEach(p => console.error(`   - ${p}`));
+      // Try to use the first path anyway (might work in some cases)
+      iconPath = possiblePaths[0];
+      console.log(`⚠️ Attempting to use: ${iconPath}`);
+    }
+    
+    // Use nativeImage to ensure proper icon loading
+    const iconImage = nativeImage.createFromPath(iconPath);
+    if (iconImage.isEmpty()) {
+      console.warn(`⚠️ Icon image is empty, but attempting to use path anyway`);
+      tray = new Tray(iconPath);
     } else {
-  tray = new Tray(iconPath);
-      console.log("✅ Tray icon loaded successfully");
+      // Set appropriate size for macOS tray icons (typically 22x22 or 16x16)
+      const resizedIcon = iconImage.resize({ width: 22, height: 22 });
+      tray = new Tray(resizedIcon);
+      console.log(`✅ Tray icon loaded and resized from: ${iconPath}`);
     }
     
     tray.setToolTip("Secret Guardian - Right-click for menu");
@@ -530,12 +508,16 @@ app.whenReady().then(() => {
     }, 1000);
   } catch (error) {
     console.error("❌ Error creating tray icon:", error);
-    // Try to create tray anyway with default icon
-    try {
-      tray = new Tray(iconPath);
-      updateTrayMenu();
-    } catch (e) {
-      console.error("❌ Failed to create tray:", e);
+    // Try to create tray anyway with default icon if we have a path
+    if (iconPath) {
+      try {
+        tray = new Tray(iconPath);
+        updateTrayMenu();
+      } catch (e) {
+        console.error("❌ Failed to create tray:", e);
+      }
+    } else {
+      console.error("❌ No valid icon path found - tray icon may not display");
     }
   }
 
@@ -546,33 +528,52 @@ app.whenReady().then(() => {
   // Register global hotkey for redacted paste
   registerRedactedPasteHotkey();
 
-  // Register paste blocking for Cmd+V/Ctrl+V in blocked apps
-  registerPasteBlocking();
-  console.log("✅ Paste blocking registered - Cmd+V/Ctrl+V will be blocked in blocked apps");
+  // Paste blocking removed - popup shows on copy, clipboard auto-clears after 60s if allowed
 
   // Handle paste actions from blocking dialog
   ipcMain.on("paste-action", (event, action, encryptedText?: string) => {
     console.log(`📥 Paste action received: ${action}`, encryptedText ? `with text: ${encryptedText.substring(0, 20)}...` : "");
     if (action === "allow") {
-      allowPasteTemporarily(60);
-      // Restore original secret to clipboard
+      // Mark that user allowed paste - don't clear clipboard on dialog close
+      setUserAllowedPasteFlag(true);
+      
+      // Ensure secret is in clipboard (it should already be there, but make sure)
       if (currentSecret) {
-        setTimeout(() => {
-          if (currentSecret) {
-            clipboard.writeText(currentSecret);
-            console.log("Original secret restored to clipboard (60s allowed)");
-          }
-        }, 100);
+        clipboard.writeText(currentSecret);
+        console.log(`✅ Secret kept in clipboard (${currentSecret.length} chars, will auto-clear in 60s)`);
       }
+      
+      // Set timer to auto-clear clipboard after 60 seconds
+      allowPasteTemporarily(60);
+      console.log("✅ Paste allowed for 60 seconds - clipboard will auto-clear after 60s");
+      
+      // Show notification
+      if (Notification.isSupported()) {
+        new Notification({
+          title: "✅ Paste Allowed",
+          body: "You can paste this secret for the next 60 seconds. It will auto-clear after that."
+        }).show();
+      }
+      
+      // Close the dialog (clipboard will NOT be cleared since flag is set)
+      closeBlockingDialog();
     } else if (action === "encrypt") {
       if (currentSecret) {
+        // Replace clipboard with encrypted version (original secret is gone)
         const encrypted = encryptForSharing(currentSecret);
         clipboard.writeText(encrypted);
-        console.log("Encrypted secret copied to clipboard");
+        console.log("✅ Original secret replaced with encrypted version - original is cleared");
+        
+        // Clear the original secret reference
+        currentSecret = null;
+        
+        // Close the dialog
+        closeBlockingDialog();
+        
         if (Notification.isSupported()) {
           new Notification({
             title: "✅ Encrypted Secret Copied",
-            body: "Encrypted secret is in clipboard. Safe to share! Others can decrypt in allowed apps."
+            body: "Encrypted secret is in clipboard. Original secret has been cleared and cannot be pasted."
           }).show();
         }
       }
@@ -630,12 +631,31 @@ app.whenReady().then(() => {
     closeBlockingDialog();
   });
 
-  // Start paste monitoring (primary method - more reliable)
-  startPasteMonitoring();
-  
+  // Handle dialog resize requests
+  ipcMain.on("resize-dialog", (event, dialogType: string, height: number) => {
+    if (dialogType === "blocking") {
+      const window = getBlockingWindow();
+      if (window) {
+        window.setSize(520, height);
+      }
+    } else if (dialogType === "decrypt") {
+      const window = getDecryptWindow();
+      if (window) {
+        window.setSize(500, height);
+      }
+    }
+  });
+
+  // Start clipboard monitoring (only if Safe Copy Mode is ON)
   const config = getConfig();
-  console.log("✅ Secret Guardian started");
-  console.log(`   Safe Paste Mode: ${config.safePasteMode ? "ON" : "OFF"}`);
+  if (config.safeCopyMode) {
+    startPasteMonitoring();
+    console.log("✅ Secret Guardian started");
+    console.log(`   Safe Copy Mode: ON - Clipboard monitoring active`);
+  } else {
+    console.log("✅ Secret Guardian started");
+    console.log(`   Safe Copy Mode: OFF - Clipboard monitoring disabled`);
+  }
 
   // Initialize lastText with current clipboard to avoid detecting pre-existing content
   try {
@@ -696,8 +716,7 @@ app.whenReady().then(() => {
       addToHistory(text, true, result.type, "Unknown");
       updateTrayMenu();
 
-      // NO NOTIFICATIONS ON COPY - only warn when pasting into blocked apps
-      // The paste monitoring will handle warnings
+      // NO NOTIFICATIONS ON COPY - dialog shown by clipboard monitoring when Safe Copy Mode is ON
 
       // Auto-clear for high-risk if enabled (silent, no notification)
       if (config.autoClearHighRisk && result.confidence === "high") {
